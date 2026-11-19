@@ -31,15 +31,16 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= НАСТРОЙКИ =================
-BOT_TOKEN = "6829445274:AAE-hNYRr-uEh7cZCruhaBySlLVFWYUn34o"
+# Токен берется автоматически из вкладки «Токен» / «Переменные» на хостинге (безопасно для публичного GitHub)
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or "6829445274:AAE-hNYRr-uEh7cZCruhaBySlLVFWYUn34o"
 ADMIN_ID = 5157852376
 SUPPORT_LINK = "https://t.me/bombystore_bot"  # Замени на свой @username поддержки
 DONATIONALERTS_URL = "https://www.donationalerts.com/r/bombychyt"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CURRENT_DB_NAME = "bombystore_v9.db"
+CURRENT_DB_NAME = "bombystore_v10.db"
 DB_PATH = os.path.join(BASE_DIR, CURRENT_DB_NAME)
-IMG_DIR = os.path.join(BASE_DIR, "assets_v9")
+IMG_DIR = os.path.join(BASE_DIR, "assets_v10")
 
 PAYMENT_DA_TEXT = (
     "🧡 <b>Оплата через DonationAlerts:</b>\n"
@@ -62,6 +63,8 @@ router = Router()
 DB_CONN: aiosqlite.Connection | None = None
 PHOTO_CACHE: dict[str, str] = {}
 KNOWN_USERS: set[int] = set()
+_RESOLVED_FONT_PATH: str | None = None
+_FONT_SEARCHED = False
 
 RAM_CATS: dict[int, dict] = {}
 RAM_CAT_ORDER: list[int] = []
@@ -322,14 +325,16 @@ CATEGORIES_DATA = [
     ),
 ]
 
-# Оригинальные файлы пользователя (подхватываются автоматически, не удаляются)
+# Оригинальные картинки из корня проекта или папки img/ (подхватываются автоматически, не удаляются)
 USER_UPLOADED_MAP = {
-    "vbucks.jpg": ["1_3.jpg", "1_2.jpg", "vbucks.jpg", "vbucks.png"],
-    "nitro.jpg": ["1.jpg", "nitro.jpg", "nitro.png"],
+    "main.jpg": ["4.jpg", "avatar.jpg", "avatar.png", "main.jpg", "main.png"],
+    "logo.jpg": ["4.jpg", "logo.jpg", "logo.png"],
+    "vbucks.jpg": ["1 (1).jpg", "1.jpg", "1_3.jpg", "vbucks.jpg", "vbucks.png"],
+    "gift_vbucks.jpg": ["xs1.jpg", "gift_vbucks.jpg", "gift_vbucks.png"],
+    "nitro.jpg": ["1_2.jpg", "nitro.jpg", "nitro.png"],
     "tg_prem.jpg": ["-1.png", "tg_prem.png", "tg_prem.jpg"],
     "exitlag.jpg": ["891.jpg", "exitlag.jpg", "exitlag.png"],
     "info.jpg": ["information.png", "info.png", "info.jpg"],
-    "logo.jpg": ["4.jpg", "logo.jpg", "logo.png"],
 }
 
 SERVICE_BANNERS = [
@@ -344,17 +349,15 @@ SERVICE_BANNERS = [
 
 # ================= АВТООЧИСТКА СТАРЫХ ПАПОК, БАННЕРОВ И БД =================
 def cleanup_old_files():
-    """Удаляет все устаревшие папки с баннерами, кэш и старые файлы баз данных при каждом запуске."""
+    """Удаляет устаревшие сгенерированные папки (assets_v*, img_v*) и старые БД. Папку img/ НЕ трогает."""
     removed_items = []
 
-    # 1. Удаляем все старые и текущую папки сгенерированных баннеров (img_v*, assets_v*)
     for pattern in ("img_v*", "assets_v*"):
         for folder_path in glob.glob(os.path.join(BASE_DIR, pattern)):
             if os.path.isdir(folder_path):
                 shutil.rmtree(folder_path, ignore_errors=True)
                 removed_items.append(os.path.basename(folder_path))
 
-    # 2. Удаляем старые базы данных (кроме активной bombystore_v9.db)
     keep_prefixes = (CURRENT_DB_NAME,)
     for pattern in ("bombystore.db*", "bombystore_v*.db*", "shop.db*", "bot.db*"):
         for db_file in glob.glob(os.path.join(BASE_DIR, pattern)):
@@ -475,9 +478,9 @@ THEME_PALETTES = {
 def _find_user_file(filenames: list):
     home = os.path.expanduser("~")
     dirs = [
-        BASE_DIR,
         os.path.join(BASE_DIR, "img"),
         os.path.join(BASE_DIR, "images"),
+        BASE_DIR,
         os.path.join(home, "Downloads"),
         os.path.join(home, "Desktop"),
     ]
@@ -490,7 +493,27 @@ def _find_user_file(filenames: list):
     return None
 
 
-def _load_bold_font(size: int):
+def _resolve_font_path() -> str | None:
+    global _RESOLVED_FONT_PATH, _FONT_SEARCHED
+    if _FONT_SEARCHED:
+        return _RESOLVED_FONT_PATH
+    _FONT_SEARCHED = True
+
+    # 1. Ищем шрифт прямо в папке img/ или корне репозитория (например, impact.ttf)
+    local_dirs = [os.path.join(BASE_DIR, "img"), os.path.join(BASE_DIR, "images"), BASE_DIR]
+    for d in local_dirs:
+        if os.path.isdir(d):
+            for pref in ("impact.ttf", "Impact.ttf", "arialbd.ttf", "font.ttf"):
+                p = os.path.join(d, pref)
+                if os.path.exists(p):
+                    _RESOLVED_FONT_PATH = p
+                    return p
+            for f in os.listdir(d):
+                if f.lower().endswith((".ttf", ".otf")):
+                    _RESOLVED_FONT_PATH = os.path.join(d, f)
+                    return _RESOLVED_FONT_PATH
+
+    # 2. Стандартные системные шрифты Windows и Linux
     font_candidates = [
         "C:\\Windows\\Fonts\\impact.ttf",
         "C:\\Windows\\Fonts\\arialbd.ttf",
@@ -500,11 +523,46 @@ def _load_bold_font(size: int):
     ]
     for p in font_candidates:
         if os.path.exists(p):
-            try:
-                return ImageFont.truetype(p, size)
-            except Exception:
-                pass
-    return ImageFont.load_default()
+            _RESOLVED_FONT_PATH = p
+            return p
+
+    # 3. Автопоиск любых .ttf/.otf шрифтов в Linux (сначала жирные, потом обычные)
+    bold_found = []
+    any_found = []
+    for search_root in ("/usr/share/fonts", "/usr/local/share/fonts"):
+        if os.path.isdir(search_root):
+            for root, _, files in os.walk(search_root):
+                for f in files:
+                    fl = f.lower()
+                    if fl.endswith((".ttf", ".otf")):
+                        full_p = os.path.join(root, f)
+                        if "bold" in fl or "black" in fl or "heavy" in fl:
+                            bold_found.append(full_p)
+                        else:
+                            any_found.append(full_p)
+
+    for p in bold_found + any_found:
+        try:
+            ImageFont.truetype(p, 48)
+            _RESOLVED_FONT_PATH = p
+            return p
+        except Exception:
+            continue
+
+    return None
+
+
+def _load_bold_font(size: int):
+    font_path = _resolve_font_path()
+    if font_path:
+        try:
+            return ImageFont.truetype(font_path, size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def _make_fallback_logo() -> Image.Image:
@@ -756,31 +814,31 @@ def prepare_all_banners():
     lp = _find_user_file(USER_UPLOADED_MAP["logo.jpg"])
     logo_img = Image.open(lp).convert("RGBA") if lp else _make_fallback_logo()
 
-    # Подключаем оригинальные файлы пользователя
+    # 1. Подключаем оригинальные файлы пользователя из папки img/ или корня
     for target, candidates in USER_UPLOADED_MAP.items():
         if target != "logo.jpg":
             dest = os.path.join(IMG_DIR, target)
             found = _find_user_file(candidates)
             if found:
-                Image.open(found).convert("RGB").save(dest, "JPEG", quality=88, optimize=True)
+                Image.open(found).convert("RGB").save(dest, "JPEG", quality=90, optimize=True)
 
-    # Пересобираем все баннеры категорий с нуля
+    # 2. Категории: берём готовый файл из img/, если его нет — генерируем сцену
     for _, _, _, img_name, theme, (t1, t2), _, _ in CATEGORIES_DATA:
         dest = os.path.join(IMG_DIR, img_name)
         if not os.path.exists(dest):
             found = _find_user_file([img_name, img_name.replace(".jpg", ".png")])
             if found:
-                Image.open(found).convert("RGB").save(dest, "JPEG", quality=88, optimize=True)
+                Image.open(found).convert("RGB").save(dest, "JPEG", quality=90, optimize=True)
             else:
                 generate_scenic_banner(dest, logo_img, theme, t1, t2)
 
-    # Пересобираем сервисные баннеры с нуля
+    # 3. Сервисные баннеры (main.jpg уже взят из аватарки 4.jpg, если она загружена)
     for img_name, theme, (t1, t2) in SERVICE_BANNERS:
         dest = os.path.join(IMG_DIR, img_name)
         if not os.path.exists(dest):
             found = _find_user_file([img_name, img_name.replace(".jpg", ".png")])
             if found:
-                Image.open(found).convert("RGB").save(dest, "JPEG", quality=88, optimize=True)
+                Image.open(found).convert("RGB").save(dest, "JPEG", quality=90, optimize=True)
             else:
                 generate_scenic_banner(dest, logo_img, theme, t1, t2)
 
@@ -840,7 +898,6 @@ async def init_db_and_cache():
         )
     """)
 
-    # Сбрасываем кэш file_id при запуске, чтобы Telegram гарантированно подтянул свежие баннеры
     await DB_CONN.execute("DELETE FROM media_cache")
     PHOTO_CACHE.clear()
 
@@ -1594,6 +1651,9 @@ async def setup_menu_commands(bot: Bot):
 
 
 async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Не найден BOT_TOKEN! Укажите токен бота во вкладке «Токен» на хостинге.")
+
     prepare_all_banners()
     await init_db_and_cache()
 
@@ -1603,7 +1663,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Bombych Store v9 успешно запущен!")
+    logging.info("Bombych Store v10 успешно запущен!")
     try:
         await dp.start_polling(
             bot,
