@@ -1,5 +1,7 @@
 import asyncio
 import glob
+import hashlib
+import html
 import logging
 import math
 import os
@@ -19,12 +21,14 @@ except ImportError:
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    Message, CallbackQuery, FSInputFile, InputMediaPhoto,
+    Message, CallbackQuery, ErrorEvent, FSInputFile, InputMediaPhoto,
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
     BotCommand, BotCommandScopeDefault
@@ -44,7 +48,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 CURRENT_DB_NAME = "bombystore_v10.db"
 DB_PATH = os.path.join(DATA_DIR, CURRENT_DB_NAME)
-IMG_DIR = os.path.join(BASE_DIR, "assets_v11")
+IMG_DIR = os.path.join(BASE_DIR, "assets_v12")
+CATALOG_SCHEMA_VERSION = "v12_fortnite_folder"
+
+FORTNITE_CAT_IDS = (1, 2, 3)
 
 PAYMENT_DA_TEXT = (
     "🧡 <b>Оплата через DonationAlerts:</b>\n"
@@ -60,12 +67,17 @@ PAYMENT_CRYPTO_TEXT = (
     "📌 После перевода нажмите <b>«📸 Отправить чек»</b> и прикрепите скриншот транзакции."
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 router = Router()
 
-# ================= ГЛОБАЛЬНЫЙ КЭШ И ПОСТОЯННОЕ СОЕДИНЕНИЕ БД =================
+# ================= ГЛОБАЛЬНЫЙ КЭШ, БЛОКИРОВКИ И БД =================
 DB_CONN: aiosqlite.Connection | None = None
+DB_LOCK = asyncio.Lock()
+USER_LOCKS: dict[int, asyncio.Lock] = {}
+LAST_SCREEN_IMG: dict[tuple[int, int], str] = {}
+
 PHOTO_CACHE: dict[str, str] = {}
+FILE_HASHES: dict[str, str] = {}
 KNOWN_USERS: set[int] = set()
 _RESOLVED_FONT_PATH: str | None = None
 _FONT_SEARCHED = False
@@ -76,6 +88,7 @@ RAM_PRODS: dict[int, dict] = {}
 RAM_CAT_KBS: dict[int, InlineKeyboardMarkup] = {}
 RAM_CAT_CAPTIONS: dict[int, str] = {}
 RAM_CATALOG_KB: InlineKeyboardMarkup | None = None
+RAM_FORTNITE_KB: InlineKeyboardMarkup | None = None
 
 
 class OrderFlow(StatesGroup):
@@ -118,7 +131,7 @@ CATEGORIES_DATA = [
         ]
     ),
     (
-        3, "📦 Наборы FN", "📦 Отряд и Наборы Fortnite", "packs.jpg", "purple_forest", ("НАБОРЫ", "FORTNITE"),
+        3, "📦 Наборы", "📦 Наборы", "packs.jpg", "purple_forest", ("НАБОРЫ", "FORTNITE"),
         "📦 <b>Подписка Отряд Fortnite (Fortnite Crew), наборы Xbox и покупка игр Epic Games.</b>",
         [
             ("Отряд Fortnite (Fortnite Crew)", "👑 Отряд", 444, 355),
@@ -331,19 +344,20 @@ CATEGORIES_DATA = [
 
 # Оригинальные файлы пользователя из папки img/ или корня (подхватываются без учёта регистра)
 USER_UPLOADED_MAP = {
-    "avatar.jpg": ["4.jpg", "avatar.jpg", "avatar.png"],
     "logo.jpg": ["4.jpg", "logo.jpg", "logo.png"],
-    "vbucks.jpg": ["1 (1).jpg", "1_3.jpg", "vbucks.jpg", "vbucks.png"],
-    "gift_vbucks.jpg": ["xs1.jpg", "gift_vbucks.jpg", "gift_vbucks.png"],
-    "nitro.jpg": ["1.jpg", "1_2.jpg", "nitro.jpg", "nitro.png"],
-    "tg_prem.jpg": ["-1.png", "tg_prem.png", "tg_prem.jpg"],
-    "exitlag.jpg": ["891.jpg", "exitlag.jpg", "exitlag.png"],
+    "vbucks.jpg": ["vbucks.jpg", "1 (1).jpg", "1_3.jpg", "vbucks.png"],
+    "gift_vbucks.jpg": ["gifts.jpg", "xs1.jpg", "gift_vbucks.jpg", "gift_vbucks.png"],
+    "nitro.jpg": ["nitro.jpg", "1.jpg", "1_2.jpg", "nitro.png"],
+    "tg_prem.jpg": ["tg_prem.jpg", "-1.png", "tg_prem.png"],
+    "exitlag.jpg": ["exitlag.jpg", "891.jpg", "exitlag.png"],
+    "brawl.jpg": ["brawl.jpg", "brawl.png"],
     "info.jpg": ["information.png", "info.png", "info.jpg"],
 }
 
 SERVICE_BANNERS = [
     ("main.jpg", "purple_forest", ("BOMBYCH", "STORE")),
     ("catalog.jpg", "purple_forest", ("КАТАЛОГ", "")),
+    ("fortnite.jpg", "purple_forest", ("FORTNITE", "")),
     ("profile.jpg", "violet_neon", ("ПРОФИЛЬ", "")),
     ("info.jpg", "purple_forest", ("INFORMATION", "")),
     ("rules.jpg", "purple_forest", ("ПРАВИЛА", "")),
@@ -351,14 +365,15 @@ SERVICE_BANNERS = [
 ]
 
 
-# ================= АВТООЧИСТКА СТАРЫХ ПАПОК, БАННЕРОВ И БД =================
+# ================= АВТООЧИСТКА СТАРЫХ ПАПОК И БД =================
 def cleanup_old_files():
-    """Удаляет сгенерированные папки (assets_v*, img_v*) и старые БД. Папку img/ НЕ трогает."""
+    """Удаляет только устаревшие папки (assets_v*, img_v* кроме текущей) и старые БД. Папку img/ НЕ трогает."""
     removed_items = []
+    current_img_folder = os.path.basename(IMG_DIR)
 
     for pattern in ("img_v*", "assets_v*"):
         for folder_path in glob.glob(os.path.join(BASE_DIR, pattern)):
-            if os.path.isdir(folder_path):
+            if os.path.isdir(folder_path) and os.path.basename(folder_path) != current_img_folder:
                 shutil.rmtree(folder_path, ignore_errors=True)
                 removed_items.append(os.path.basename(folder_path))
 
@@ -507,6 +522,14 @@ def _find_user_file(filenames: list) -> str | None:
     return None
 
 
+def _file_md5(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _download_fallback_font() -> str | None:
     fallback_path = os.path.join("/tmp", "BombychFont-Bold.ttf")
     if os.path.exists(fallback_path) and os.path.getsize(fallback_path) > 10000:
@@ -538,7 +561,6 @@ def _resolve_font_path() -> str | None:
         return _RESOLVED_FONT_PATH
     _FONT_SEARCHED = True
 
-    # 1. Ищем шрифт в img/, images/ и корне проекта (без учёта регистра)
     local_dirs = [
         os.path.join(BASE_DIR, "img"),
         os.path.join(BASE_DIR, "images"),
@@ -574,7 +596,6 @@ def _resolve_font_path() -> str | None:
                 except Exception:
                     pass
 
-    # 2. Стандартные системные шрифты Windows / Linux
     font_candidates = [
         "C:\\Windows\\Fonts\\impact.ttf",
         "C:\\Windows\\Fonts\\arialbd.ttf",
@@ -592,9 +613,7 @@ def _resolve_font_path() -> str | None:
             except Exception:
                 pass
 
-    # 3. Автопоиск любых .ttf/.otf шрифтов в Linux
-    bold_found = []
-    any_found = []
+    bold_found, any_found = [], []
     for search_root in ("/usr/share/fonts", "/usr/local/share/fonts"):
         if os.path.isdir(search_root):
             for root, _, files in os.walk(search_root):
@@ -616,7 +635,6 @@ def _resolve_font_path() -> str | None:
         except Exception:
             continue
 
-    # 4. Резервная загрузка шрифта с кириллицей
     downloaded = _download_fallback_font()
     if downloaded:
         _RESOLVED_FONT_PATH = downloaded
@@ -879,157 +897,253 @@ def generate_scenic_banner(filepath: str, logo_img: Image.Image, theme: str, lin
 
     _draw_foreground_foliage_and_grass(base, pal, rng)
     _render_chisel_3d_text(base, line1, line2, pal)
-    base.convert("RGB").save(filepath, "JPEG", quality=85, optimize=True)
+    base.convert("RGB").save(filepath, "JPEG", quality=82, optimize=True)
+
+
+def _compute_assets_stamp() -> str:
+    """Хэш состава папки img/ и шрифта — перегенерируем баннеры только при изменениях."""
+    h = hashlib.md5()
+    h.update((_resolve_font_path() or "default").encode("utf-8"))
+    for d in (os.path.join(BASE_DIR, "img"), os.path.join(BASE_DIR, "images")):
+        if os.path.isdir(d):
+            for fname in sorted(os.listdir(d)):
+                fp = os.path.join(d, fname)
+                if os.path.isfile(fp):
+                    st = os.stat(fp)
+                    h.update(f"{fname}:{st.st_size}:{int(st.st_mtime)}".encode("utf-8"))
+    return h.hexdigest()
 
 
 def prepare_all_banners():
     cleanup_old_files()
     os.makedirs(IMG_DIR, exist_ok=True)
 
-    lp = _find_user_file(USER_UPLOADED_MAP["logo.jpg"])
-    logo_img = Image.open(lp).convert("RGBA") if lp else _make_fallback_logo()
+    stamp_file = os.path.join(IMG_DIR, ".stamp")
+    current_stamp = _compute_assets_stamp()
+    need_rebuild = True
+    if os.path.exists(stamp_file):
+        try:
+            with open(stamp_file, "r", encoding="utf-8") as f:
+                if f.read().strip() == current_stamp:
+                    need_rebuild = False
+        except OSError:
+            pass
 
-    # 1. Подключаем оригинальные картинки пользователя из папки img/
-    for target, candidates in USER_UPLOADED_MAP.items():
-        if target != "logo.jpg":
-            dest = os.path.join(IMG_DIR, target)
-            found = _find_user_file(candidates)
-            if found:
-                Image.open(found).convert("RGB").save(dest, "JPEG", quality=90, optimize=True)
+    if need_rebuild:
+        lp = _find_user_file(USER_UPLOADED_MAP["logo.jpg"])
+        logo_img = Image.open(lp).convert("RGBA") if lp else _make_fallback_logo()
 
-    # Гарантируем наличие аватарки для приветствия
-    avatar_dest = os.path.join(IMG_DIR, "avatar.jpg")
-    if not os.path.exists(avatar_dest):
-        logo_img.convert("RGB").save(avatar_dest, "JPEG", quality=90, optimize=True)
+        # 1. Подключаем оригинальные картинки пользователя из папки img/
+        for target, candidates in USER_UPLOADED_MAP.items():
+            if target != "logo.jpg":
+                dest = os.path.join(IMG_DIR, target)
+                found = _find_user_file(candidates)
+                if found:
+                    Image.open(found).convert("RGB").save(dest, "JPEG", quality=86, optimize=True)
 
-    # 2. Категории: берём готовый файл из img/, иначе генерируем сцену
-    for _, _, _, img_name, theme, (t1, t2), _, _ in CATEGORIES_DATA:
-        dest = os.path.join(IMG_DIR, img_name)
-        if not os.path.exists(dest):
+        # 2. Категории: берём готовый файл из img/, иначе генерируем сцену
+        for _, _, _, img_name, theme, (t1, t2), _, _ in CATEGORIES_DATA:
+            dest = os.path.join(IMG_DIR, img_name)
             found = _find_user_file([img_name, img_name.replace(".jpg", ".png")])
             if found:
-                Image.open(found).convert("RGB").save(dest, "JPEG", quality=90, optimize=True)
-            else:
+                Image.open(found).convert("RGB").save(dest, "JPEG", quality=86, optimize=True)
+            elif not os.path.exists(dest) or target_not_uploaded(img_name):
                 generate_scenic_banner(dest, logo_img, theme, t1, t2)
 
-    # 3. Сервисные баннеры
-    for img_name, theme, (t1, t2) in SERVICE_BANNERS:
-        dest = os.path.join(IMG_DIR, img_name)
-        if not os.path.exists(dest):
+        # 3. Сервисные баннеры
+        for img_name, theme, (t1, t2) in SERVICE_BANNERS:
+            dest = os.path.join(IMG_DIR, img_name)
             found = _find_user_file([img_name, img_name.replace(".jpg", ".png")])
             if found:
-                Image.open(found).convert("RGB").save(dest, "JPEG", quality=90, optimize=True)
-            else:
+                Image.open(found).convert("RGB").save(dest, "JPEG", quality=86, optimize=True)
+            elif not os.path.exists(dest) or target_not_uploaded(img_name):
                 generate_scenic_banner(dest, logo_img, theme, t1, t2)
+
+        with open(stamp_file, "w", encoding="utf-8") as f:
+            f.write(current_stamp)
+
+    # Кэшируем MD5 всех итоговых файлов для мгновенной валидации Telegram file_id
+    FILE_HASHES.clear()
+    for fname in os.listdir(IMG_DIR):
+        if fname.endswith((".jpg", ".png")):
+            FILE_HASHES[fname] = _file_md5(os.path.join(IMG_DIR, fname))
+
+
+def target_not_uploaded(img_name: str) -> bool:
+    cands = USER_UPLOADED_MAP.get(img_name, [])
+    return _find_user_file(cands) is None if cands else True
 
 
 # ================= БАЗА ДАННЫХ И RAM-КЭШИРОВАНИЕ =================
 async def init_db_and_cache():
     global DB_CONN
-    DB_CONN = await aiosqlite.connect(DB_PATH)
+    DB_CONN = await aiosqlite.connect(DB_PATH, timeout=15)
     await DB_CONN.execute("PRAGMA journal_mode=WAL")
     await DB_CONN.execute("PRAGMA synchronous=NORMAL")
+    await DB_CONN.execute("PRAGMA busy_timeout=5000")
+    await DB_CONN.execute("PRAGMA temp_store=MEMORY")
 
-    await DB_CONN.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            balance REAL DEFAULT 0,
-            joined_at TEXT
-        )
-    """)
-    await DB_CONN.execute("""
-        CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY,
-            short_name TEXT NOT NULL,
-            full_title TEXT NOT NULL,
-            image_name TEXT,
-            description TEXT
-        )
-    """)
-    await DB_CONN.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category_id INTEGER,
-            full_name TEXT NOT NULL,
-            btn_label TEXT NOT NULL,
-            old_price REAL NOT NULL,
-            price REAL NOT NULL,
-            image_name TEXT
-        )
-    """)
-    await DB_CONN.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            product_name TEXT,
-            price REAL,
-            pay_method TEXT,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT
-        )
-    """)
-    await DB_CONN.execute("""
-        CREATE TABLE IF NOT EXISTS media_cache (
-            image_name TEXT PRIMARY KEY,
-            file_id TEXT NOT NULL,
-            file_mtime REAL NOT NULL
-        )
-    """)
-
-    # Сбрасываем кэш file_id при каждом запуске, чтобы Telegram сразу показал свежие картинки
-    await DB_CONN.execute("DELETE FROM media_cache")
-    PHOTO_CACHE.clear()
-
-    cur = await DB_CONN.execute("SELECT COUNT(*) FROM categories")
-    if (await cur.fetchone())[0] == 0:
-        for cid, short_n, full_t, cimg, _, _, cdesc, items in CATEGORIES_DATA:
-            await DB_CONN.execute(
-                "INSERT INTO categories (id, short_name, full_title, image_name, description) VALUES (?, ?, ?, ?, ?)",
-                (cid, short_n, full_t, cimg, cdesc)
+    async with DB_LOCK:
+        await DB_CONN.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                balance REAL DEFAULT 0,
+                joined_at TEXT
             )
-            for fname, short_btn, old_p, new_p in items:
-                btn_lbl = short_btn if "₽" in short_btn else f"{short_btn} • {new_p}₽"
-                await DB_CONN.execute(
-                    "INSERT INTO products (category_id, full_name, btn_label, old_price, price, image_name) VALUES (?, ?, ?, ?, ?, ?)",
-                    (cid, fname, btn_lbl, old_p, new_p, cimg)
-                )
-    await DB_CONN.commit()
+        """)
+        await DB_CONN.execute("""
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY,
+                short_name TEXT NOT NULL,
+                full_title TEXT NOT NULL,
+                image_name TEXT,
+                description TEXT
+            )
+        """)
+        await DB_CONN.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id INTEGER,
+                full_name TEXT NOT NULL,
+                btn_label TEXT NOT NULL,
+                old_price REAL NOT NULL,
+                price REAL NOT NULL,
+                image_name TEXT
+            )
+        """)
+        await DB_CONN.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                product_name TEXT,
+                price REAL,
+                pay_method TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT
+            )
+        """)
+        await DB_CONN.execute("""
+            CREATE TABLE IF NOT EXISTS media_cache_v2 (
+                image_name TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                file_hash TEXT NOT NULL
+            )
+        """)
+        await DB_CONN.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
 
-    cur = await DB_CONN.execute("SELECT user_id FROM users")
-    for (uid,) in await cur.fetchall():
-        KNOWN_USERS.add(uid)
+        async with DB_CONN.execute("SELECT COUNT(*) FROM categories") as cur:
+            cat_count = (await cur.fetchone())[0]
+
+        if cat_count == 0:
+            for cid, short_n, full_t, cimg, _, _, cdesc, items in CATEGORIES_DATA:
+                await DB_CONN.execute(
+                    "INSERT INTO categories (id, short_name, full_title, image_name, description) VALUES (?, ?, ?, ?, ?)",
+                    (cid, short_n, full_t, cimg, cdesc)
+                )
+                for fname, short_btn, old_p, new_p in items:
+                    btn_lbl = short_btn if "₽" in short_btn else f"{short_btn} • {new_p}₽"
+                    await DB_CONN.execute(
+                        "INSERT INTO products (category_id, full_name, btn_label, old_price, price, image_name) VALUES (?, ?, ?, ?, ?, ?)",
+                        (cid, fname, btn_lbl, old_p, new_p, cimg)
+                    )
+        else:
+            # Мягкое обновление названий/описаний категорий без потери заказов и товаров
+            async with DB_CONN.execute("SELECT value FROM settings WHERE key = 'catalog_ver'") as cur:
+                row = await cur.fetchone()
+                cur_ver = row[0] if row else None
+
+            if cur_ver != CATALOG_SCHEMA_VERSION:
+                for cid, short_n, full_t, cimg, _, _, cdesc, items in CATEGORIES_DATA:
+                    async with DB_CONN.execute("SELECT 1 FROM categories WHERE id = ?", (cid,)) as c2:
+                        exists = await c2.fetchone()
+                    if exists:
+                        await DB_CONN.execute(
+                            "UPDATE categories SET short_name = ?, full_title = ?, image_name = ?, description = ? WHERE id = ?",
+                            (short_n, full_t, cimg, cdesc, cid)
+                        )
+                    else:
+                        await DB_CONN.execute(
+                            "INSERT INTO categories (id, short_name, full_title, image_name, description) VALUES (?, ?, ?, ?, ?)",
+                            (cid, short_n, full_t, cimg, cdesc)
+                        )
+                        for fname, short_btn, old_p, new_p in items:
+                            btn_lbl = short_btn if "₽" in short_btn else f"{short_btn} • {new_p}₽"
+                            await DB_CONN.execute(
+                                "INSERT INTO products (category_id, full_name, btn_label, old_price, price, image_name) VALUES (?, ?, ?, ?, ?, ?)",
+                                (cid, fname, btn_lbl, old_p, new_p, cimg)
+                            )
+
+        await DB_CONN.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('catalog_ver', ?)",
+            (CATALOG_SCHEMA_VERSION,)
+        )
+        await DB_CONN.commit()
+
+    # Подгружаем актуальный кэш file_id из БД (только если хэш картинки не изменился)
+    PHOTO_CACHE.clear()
+    async with DB_CONN.execute("SELECT image_name, file_id, file_hash FROM media_cache_v2") as cur:
+        for img_name, fid, fhash in await cur.fetchall():
+            if FILE_HASHES.get(img_name) == fhash:
+                PHOTO_CACHE[img_name] = fid
+
+    async with DB_CONN.execute("SELECT user_id FROM users") as cur:
+        for (uid,) in await cur.fetchall():
+            KNOWN_USERS.add(uid)
 
     await reload_catalog_cache()
 
 
 async def reload_catalog_cache():
-    global RAM_CATALOG_KB
+    global RAM_CATALOG_KB, RAM_FORTNITE_KB
     RAM_CATS.clear()
     RAM_CAT_ORDER.clear()
     RAM_PRODS.clear()
     RAM_CAT_KBS.clear()
     RAM_CAT_CAPTIONS.clear()
 
-    cur = await DB_CONN.execute("SELECT id, short_name, full_title, image_name, description FROM categories ORDER BY id")
-    cats = await cur.fetchall()
+    async with DB_CONN.execute("SELECT id, short_name, full_title, image_name, description FROM categories ORDER BY id") as cur:
+        cats = await cur.fetchall()
 
     cat_builder = InlineKeyboardBuilder()
+    cat_builder.button(text="🎮 Fortnite", callback_data="nav_fortnite")
+
+    fn_builder = InlineKeyboardBuilder()
+
     for cid, sname, ftitle, cimg, cdesc in cats:
         RAM_CAT_ORDER.append(cid)
         RAM_CATS[cid] = {
             "id": cid, "short_name": sname, "full_title": ftitle,
             "image_name": cimg, "description": cdesc
         }
-        cat_builder.button(text=sname, callback_data=f"cat_{cid}")
+        if cid in FORTNITE_CAT_IDS:
+            fn_builder.button(text=sname, callback_data=f"cat_{cid}")
+        else:
+            cat_builder.button(text=sname, callback_data=f"cat_{cid}")
+
     cat_builder.adjust(2)
     cat_builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav_home"))
     RAM_CATALOG_KB = cat_builder.as_markup()
 
-    cur = await DB_CONN.execute("SELECT id, category_id, full_name, btn_label, old_price, price, image_name FROM products ORDER BY id")
+    fn_builder.adjust(2, 1)
+    fn_builder.row(InlineKeyboardButton(text="🧶 Инструкция по привязке Xbox", callback_data="nav_xbox"))
+    fn_builder.row(
+        InlineKeyboardButton(text="⬅️ В каталог", callback_data="nav_catalog"),
+        InlineKeyboardButton(text="🏠 Меню", callback_data="nav_home")
+    )
+    RAM_FORTNITE_KB = fn_builder.as_markup()
+
+    async with DB_CONN.execute("SELECT id, category_id, full_name, btn_label, old_price, price, image_name FROM products ORDER BY id") as cur:
+        all_prods = await cur.fetchall()
+
     prods_by_cat: dict[int, list] = {cid: [] for cid in RAM_CAT_ORDER}
-    for pid, cid, fname, btn_lbl, old_p, price, pimg in await cur.fetchall():
+    for pid, cid, fname, btn_lbl, old_p, price, pimg in all_prods:
         prod_obj = {
             "id": pid, "category_id": cid, "full_name": fname,
             "btn_label": btn_lbl, "old_price": old_p, "price": price, "image_name": pimg
@@ -1043,14 +1157,20 @@ async def reload_catalog_cache():
         lines = []
         for p in items:
             pb.button(text=p["btn_label"], callback_data=f"prod_{p['id']}")
-            lines.append(f"▫️ <b>{p['full_name']}</b> — <s>{p['old_price']:.0f}₽</s> <b><code>{p['price']:.0f} ₽</code></b>")
+            lines.append(f"▫️ <b>{html.escape(p['full_name'])}</b> — <s>{p['old_price']:.0f}₽</s> <b><code>{p['price']:.0f} ₽</code></b>")
         pb.adjust(2)
         if cid in (1, 3):
             pb.row(InlineKeyboardButton(text="🧶 Инструкция по привязке Xbox", callback_data="nav_xbox"))
-        pb.row(
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="nav_catalog"),
-            InlineKeyboardButton(text="🏠 Меню", callback_data="nav_home")
-        )
+        if cid in FORTNITE_CAT_IDS:
+            pb.row(
+                InlineKeyboardButton(text="⬅️ К Fortnite", callback_data="nav_fortnite"),
+                InlineKeyboardButton(text="🏠 Меню", callback_data="nav_home")
+            )
+        else:
+            pb.row(
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="nav_catalog"),
+                InlineKeyboardButton(text="🏠 Меню", callback_data="nav_home")
+            )
         RAM_CAT_KBS[cid] = pb.as_markup()
         RAM_CAT_CAPTIONS[cid] = (
             f"<b>{cat['full_title']}</b>\n"
@@ -1063,70 +1183,138 @@ async def reload_catalog_cache():
 
 async def _save_file_id_bg(image_name: str, file_id: str):
     try:
-        p = os.path.join(IMG_DIR, image_name)
-        mtime = os.path.getmtime(p) if os.path.exists(p) else 0.0
-        await DB_CONN.execute(
-            "INSERT OR REPLACE INTO media_cache (image_name, file_id, file_mtime) VALUES (?, ?, ?)",
-            (image_name, file_id, mtime)
-        )
-        await DB_CONN.commit()
-    except Exception:
-        pass
+        fhash = FILE_HASHES.get(image_name, "")
+        async with DB_LOCK:
+            await DB_CONN.execute(
+                "INSERT OR REPLACE INTO media_cache_v2 (image_name, file_id, file_hash) VALUES (?, ?, ?)",
+                (image_name, file_id, fhash)
+            )
+            await DB_CONN.commit()
+    except Exception as e:
+        logging.debug(f"Не удалось сохранить file_id для {image_name}: {e}")
 
 
 async def register_user(user):
     if user.id in KNOWN_USERS:
         return
     KNOWN_USERS.add(user.id)
-    await DB_CONN.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, first_name, joined_at) VALUES (?, ?, ?, ?)",
-        (user.id, user.username or "Клиент", user.first_name or "Гость", datetime.now().strftime("%d.%m.%Y"))
-    )
-    await DB_CONN.commit()
-
-
-# ================= МГНОВЕННАЯ ОТРИСОВКА ЭКРАНОВ =================
-async def _quick_answer(call: CallbackQuery):
     try:
-        await call.answer()
+        async with DB_LOCK:
+            await DB_CONN.execute(
+                "INSERT OR IGNORE INTO users (user_id, username, first_name, joined_at) VALUES (?, ?, ?, ?)",
+                (user.id, user.username or "Клиент", user.first_name or "Гость", datetime.now().strftime("%d.%m.%Y"))
+            )
+            await DB_CONN.commit()
+    except Exception as e:
+        KNOWN_USERS.discard(user.id)
+        logging.warning(f"Ошибка регистрации пользователя {user.id}: {e}")
+
+
+# ================= БЫСТРАЯ И БЕЗОПАСНАЯ ОТРИСОВКА ЭКРАНОВ =================
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    if len(USER_LOCKS) > 2000:
+        for uid in list(USER_LOCKS.keys())[:1000]:
+            if not USER_LOCKS[uid].locked():
+                USER_LOCKS.pop(uid, None)
+    lock = USER_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        USER_LOCKS[user_id] = lock
+    return lock
+
+
+def _remember_screen(chat_id: int, message_id: int, image_name: str):
+    if len(LAST_SCREEN_IMG) > 5000:
+        for k in list(LAST_SCREEN_IMG.keys())[:2500]:
+            LAST_SCREEN_IMG.pop(k, None)
+    LAST_SCREEN_IMG[(chat_id, message_id)] = image_name
+
+
+async def _quick_answer(call: CallbackQuery, text: str | None = None, show_alert: bool = False):
+    try:
+        await call.answer(text=text, show_alert=show_alert)
     except Exception:
         pass
 
 
-async def show_screen(target, image_name: str, caption: str, kb: InlineKeyboardMarkup):
+async def _send_fresh_photo(msg_target: Message, image_name: str, caption: str, kb: InlineKeyboardMarkup):
     cached_fid = PHOTO_CACHE.get(image_name)
-    media_file = cached_fid or FSInputFile(os.path.join(IMG_DIR, image_name))
+    file_path = os.path.join(IMG_DIR, image_name)
+    media_file = cached_fid or FSInputFile(file_path)
 
+    sent = await msg_target.answer_photo(photo=media_file, caption=caption, reply_markup=kb)
+    _remember_screen(sent.chat.id, sent.message_id, image_name)
+    if not cached_fid and sent.photo:
+        fid = sent.photo[-1].file_id
+        PHOTO_CACHE[image_name] = fid
+        asyncio.create_task(_save_file_id_bg(image_name, fid))
+    return sent
+
+
+async def show_screen(target, image_name: str, caption: str, kb: InlineKeyboardMarkup):
     if isinstance(target, CallbackQuery):
         asyncio.create_task(_quick_answer(target))
-        try:
-            msg = await target.message.edit_media(
-                media=InputMediaPhoto(media=media_file, caption=caption, parse_mode=ParseMode.HTML),
-                reply_markup=kb
-            )
-            if not cached_fid and msg and msg.photo:
-                fid = msg.photo[-1].file_id
-                PHOTO_CACHE[image_name] = fid
-                asyncio.create_task(_save_file_id_bg(image_name, fid))
-            return
-        except Exception as e:
-            if "not modified" in str(e).lower():
+        lock = _get_user_lock(target.from_user.id)
+        async with lock:
+            msg = target.message
+            if not msg:
                 return
+            chat_id, msg_id = msg.chat.id, msg.message_id
+            same_image = (LAST_SCREEN_IMG.get((chat_id, msg_id)) == image_name) and bool(msg.photo)
+
+            # Быстрый путь: если картинка та же — меняем только подпись и кнопки без перезагрузки медиа
+            if same_image:
+                try:
+                    await msg.edit_caption(caption=caption, reply_markup=kb)
+                    return
+                except TelegramBadRequest as e:
+                    if "not modified" in str(e).lower():
+                        return
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(min(e.retry_after, 2.5))
+                    try:
+                        await msg.edit_caption(caption=caption, reply_markup=kb)
+                        return
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            # Стандартный путь: меняем картинку через edit_media
+            cached_fid = PHOTO_CACHE.get(image_name)
+            media_file = cached_fid or FSInputFile(os.path.join(IMG_DIR, image_name))
             try:
-                await target.message.delete()
+                edited = await msg.edit_media(
+                    media=InputMediaPhoto(media=media_file, caption=caption, parse_mode=ParseMode.HTML),
+                    reply_markup=kb
+                )
+                _remember_screen(chat_id, msg_id, image_name)
+                if not cached_fid and edited and edited.photo:
+                    fid = edited.photo[-1].file_id
+                    PHOTO_CACHE[image_name] = fid
+                    asyncio.create_task(_save_file_id_bg(image_name, fid))
+                return
+            except TelegramBadRequest as e:
+                if "not modified" in str(e).lower():
+                    return
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(min(e.retry_after, 2.5))
             except Exception:
                 pass
-            msg = await target.message.answer_photo(photo=media_file, caption=caption, reply_markup=kb)
-            if not cached_fid and msg.photo:
-                fid = msg.photo[-1].file_id
-                PHOTO_CACHE[image_name] = fid
-                asyncio.create_task(_save_file_id_bg(image_name, fid))
+
+            # Резервный путь: удаляем старое сообщение и отправляем новое фото
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            try:
+                await _send_fresh_photo(msg, image_name, caption, kb)
+            except Exception as e:
+                logging.error(f"Ошибка отправки экрана {image_name}: {e}")
     else:
-        msg = await target.answer_photo(photo=media_file, caption=caption, reply_markup=kb)
-        if not cached_fid and msg.photo:
-            fid = msg.photo[-1].file_id
-            PHOTO_CACHE[image_name] = fid
-            asyncio.create_task(_save_file_id_bg(image_name, fid))
+        lock = _get_user_lock(target.from_user.id)
+        async with lock:
+            await _send_fresh_photo(target, image_name, caption, kb)
 
 
 # ================= КЛАВИАТУРЫ =================
@@ -1164,7 +1352,7 @@ BACK_HOME_KB = InlineKeyboardMarkup(inline_keyboard=[
 ])
 BACK_XBOX_KB = InlineKeyboardMarkup(inline_keyboard=[
     [
-        InlineKeyboardButton(text="⬅️ К В-Баксам", callback_data="cat_1"),
+        InlineKeyboardButton(text="⬅️ В Fortnite", callback_data="nav_fortnite"),
         InlineKeyboardButton(text="🏠 Меню", callback_data="nav_home")
     ]
 ])
@@ -1174,7 +1362,7 @@ BACK_XBOX_KB = InlineKeyboardMarkup(inline_keyboard=[
 HOME_TEXT = (
     "💜 <b>Bombych Store • Магазин игрового доната</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "<blockquote>💎 <b>Fortnite:</b> В-Баксы, В-Баксы подарком, Отряд и Наборы\n"
+    "<blockquote>🎮 <b>Fortnite:</b> В-Баксы, В-Баксы подарком и Наборы\n"
     "🌴 <b>Новинка:</b> GTA VI для PlayStation и Xbox\n"
     "📱 <b>Игры:</b> Brawl Stars, Roblox, Genshin, Standoff 2, Clash Royale, CoC, Free Fire, PUBG, Вирты\n"
     "💻 <b>Сервисы:</b> Telegram (Premium и Звёзды), Steam, Discord Nitro, ChatGPT, Spotify, ExitLag, Банки</blockquote>\n"
@@ -1190,6 +1378,15 @@ CATALOG_TEXT = (
     "🛡 Официальное пополнение и 100% гарантия выдачи\n"
     "⚡ Быстрая обработка заказа сразу после оплаты</blockquote>\n"
     "👇 <b>Выберите интересующую категорию:</b>"
+)
+
+FORTNITE_TEXT = (
+    "🎮 <b>Fortnite • Bombych Store</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "<blockquote>💎 <b>В-Баксы</b> — официальное пополнение на ваш аккаунт\n"
+    "🎁 <b>ВБ подарком</b> — скины, кирки и эмоции подарком из магазина\n"
+    "📦 <b>Наборы</b> — Отряд Fortnite, стартер-паки, БП и игры Epic</blockquote>\n"
+    "👇 <b>Выберите нужный раздел Fortnite:</b>"
 )
 
 INFO_TEXT = (
@@ -1231,23 +1428,14 @@ XBOX_TEXT = (
 # ================= НАВИГАЦИЯ =================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
+    if await state.get_state():
+        await state.clear()
     await register_user(message.from_user)
     kb = HOME_KB_ADMIN if message.from_user.id == ADMIN_ID else HOME_KB_USER
-
-    # Приветствие сразу с твоей аватаркой 4.jpg
-    avatar_fid = PHOTO_CACHE.get("avatar.jpg")
-    avatar_media = avatar_fid or FSInputFile(os.path.join(IMG_DIR, "avatar.jpg"))
-    welcome_msg = await message.answer_photo(
-        photo=avatar_media,
-        caption="💜 <b>Добро пожаловать в официальный магазин Bombych Store!</b>",
+    await message.answer(
+        "💜 <b>Добро пожаловать в официальный магазин Bombych Store!</b>",
         reply_markup=reply_main_kb(message.from_user.id)
     )
-    if not avatar_fid and welcome_msg.photo:
-        fid = welcome_msg.photo[-1].file_id
-        PHOTO_CACHE["avatar.jpg"] = fid
-        asyncio.create_task(_save_file_id_bg("avatar.jpg", fid))
-
     await show_screen(message, "main.jpg", HOME_TEXT, kb)
 
 
@@ -1274,41 +1462,62 @@ async def cb_catalog(call: CallbackQuery, state: FSMContext):
     await show_screen(call, "catalog.jpg", CATALOG_TEXT, RAM_CATALOG_KB)
 
 
+@router.callback_query(F.data == "nav_fortnite")
+async def cb_fortnite(call: CallbackQuery, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
+    await show_screen(call, "fortnite.jpg", FORTNITE_TEXT, RAM_FORTNITE_KB)
+
+
 @router.message(Command("info"))
 @router.message(F.text.in_({"ℹ️ Инфо", "ℹ️ Информация"}))
-async def msg_info(message: Message):
+async def msg_info(message: Message, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
     await show_screen(message, "info.jpg", INFO_TEXT, BACK_HOME_KB)
 
 
 @router.callback_query(F.data == "nav_info")
-async def cb_info(call: CallbackQuery):
+async def cb_info(call: CallbackQuery, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
     await show_screen(call, "info.jpg", INFO_TEXT, BACK_HOME_KB)
 
 
 @router.message(Command("rules"))
 @router.message(F.text == "📕 Правила")
-async def msg_rules(message: Message):
+async def msg_rules(message: Message, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
     await show_screen(message, "rules.jpg", RULES_TEXT, BACK_HOME_KB)
 
 
 @router.callback_query(F.data == "nav_rules")
-async def cb_rules(call: CallbackQuery):
+async def cb_rules(call: CallbackQuery, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
     await show_screen(call, "rules.jpg", RULES_TEXT, BACK_HOME_KB)
 
 
 @router.message(Command("xbox"))
 @router.message(F.text.in_({"🧶 Привязка", "🧶 Привязка Xbox"}))
-async def msg_xbox(message: Message):
+async def msg_xbox(message: Message, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
     await show_screen(message, "xbox.jpg", XBOX_TEXT, BACK_XBOX_KB)
 
 
 @router.callback_query(F.data == "nav_xbox")
-async def cb_xbox(call: CallbackQuery):
+async def cb_xbox(call: CallbackQuery, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
     await show_screen(call, "xbox.jpg", XBOX_TEXT, BACK_XBOX_KB)
 
 
 @router.message(Command("support"))
-async def cmd_support(message: Message):
+async def cmd_support(message: Message, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Написать в поддержку", url=SUPPORT_LINK)],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav_home")]
@@ -1319,15 +1528,15 @@ async def cmd_support(message: Message):
 # ================= ПРОФИЛЬ И ИСТОРИЯ ЗАКАЗОВ =================
 async def build_profile_view(user):
     await register_user(user)
-    cur = await DB_CONN.execute("SELECT balance, joined_at FROM users WHERE user_id = ?", (user.id,))
-    row = await cur.fetchone()
+    async with DB_CONN.execute("SELECT balance, joined_at FROM users WHERE user_id = ?", (user.id,)) as cur:
+        row = await cur.fetchone()
     balance, joined_at = row if row else (0.0, datetime.now().strftime("%d.%m.%Y"))
 
-    cur = await DB_CONN.execute(
+    async with DB_CONN.execute(
         "SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE user_id = ? AND status = 'completed'",
         (user.id,)
-    )
-    done_cnt, total_spent = await cur.fetchone()
+    ) as cur:
+        done_cnt, total_spent = await cur.fetchone()
 
     if user.id == ADMIN_ID:
         role = "Основатель ♦"
@@ -1338,8 +1547,9 @@ async def build_profile_view(user):
     else:
         role = "Клиент 🛴"
 
+    safe_name = html.escape(user.first_name or "Гость")
     text = (
-        f"👤 <b>Личный кабинет • {user.first_name}</b>\n"
+        f"👤 <b>Личный кабинет • {safe_name}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🆔 <b>Ваш ID:</b> <code>{user.id}</code>\n"
         f"🎭 <b>Статус:</b> <b>{role}</b>\n"
@@ -1378,12 +1588,14 @@ async def cb_profile(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data == "my_orders")
-async def cb_my_orders(call: CallbackQuery):
-    cur = await DB_CONN.execute(
+async def cb_my_orders(call: CallbackQuery, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
+    async with DB_CONN.execute(
         "SELECT id, product_name, price, status FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 8",
         (call.from_user.id,)
-    )
-    rows = await cur.fetchall()
+    ) as cur:
+        rows = await cur.fetchall()
 
     st_icons = {
         "pending": "⏳ Ожидает оплаты",
@@ -1394,7 +1606,10 @@ async def cb_my_orders(call: CallbackQuery):
     if not rows:
         body = "<i>У вас пока нет завершенных или активных заказов.</i>"
     else:
-        body = "\n".join([f"• <b>#{oid}</b> | {pname} (<b>{price:.0f}₽</b>) — {st_icons.get(st, st)}" for oid, pname, price, st in rows])
+        body = "\n".join([
+            f"• <b>#{oid}</b> | {html.escape(pname)} (<b>{price:.0f}₽</b>) — {st_icons.get(st, st)}"
+            for oid, pname, price, st in rows
+        ])
 
     text = f"📦 <b>История заказов</b>\n━━━━━━━━━━━━━━━━━━━━\n{body}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1411,10 +1626,14 @@ async def cb_my_orders(call: CallbackQuery):
 async def cb_category(call: CallbackQuery, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    cat_id = int(call.data.split("_")[1])
+    try:
+        cat_id = int(call.data.split("_")[1])
+    except (IndexError, ValueError):
+        return await _quick_answer(call, "Раздел не найден", show_alert=True)
+
     cat = RAM_CATS.get(cat_id)
     if not cat:
-        return await call.answer("Раздел не найден", show_alert=True)
+        return await _quick_answer(call, "Раздел не найден", show_alert=True)
 
     await show_screen(call, cat["image_name"], RAM_CAT_CAPTIONS[cat_id], RAM_CAT_KBS[cat_id])
 
@@ -1423,17 +1642,21 @@ async def cb_category(call: CallbackQuery, state: FSMContext):
 async def cb_product(call: CallbackQuery, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    pid = int(call.data.split("_")[1])
+    try:
+        pid = int(call.data.split("_")[1])
+    except (IndexError, ValueError):
+        return await _quick_answer(call, "Товар не найден", show_alert=True)
+
     prod = RAM_PRODS.get(pid)
     if not prod:
-        return await call.answer("Товар не найден", show_alert=True)
+        return await _quick_answer(call, "Товар не найден", show_alert=True)
 
     cat = RAM_CATS[prod["category_id"]]
     caption = (
         f"🛍 <b>Оформление заказа</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📂 Категория: <b>{cat['full_title']}</b>\n"
-        f"💎 Товар: <b>{prod['full_name']}</b>\n"
+        f"💎 Товар: <b>{html.escape(prod['full_name'])}</b>\n"
         f"💰 Стоимость: <s>{prod['old_price']:.0f} ₽</s> <b><code>{prod['price']:.0f} ₽</code></b>\n\n"
         f"<blockquote>{cat['description']}</blockquote>\n"
         f"👇 <b>Выберите удобный способ оплаты:</b>"
@@ -1443,35 +1666,45 @@ async def cb_product(call: CallbackQuery, state: FSMContext):
     b.button(text="🪙 Криптовалюта", callback_data=f"pay_crypto_{pid}")
     b.button(text="💳 СБП / Карта", callback_data="pay_sbp_soon")
     b.button(text="⬅️ Назад", callback_data=f"cat_{prod['category_id']}")
-    b.button(text="🛒 Каталог", callback_data="nav_catalog")
+    if prod["category_id"] in FORTNITE_CAT_IDS:
+        b.button(text="🎮 Fortnite", callback_data="nav_fortnite")
+    else:
+        b.button(text="🛒 Каталог", callback_data="nav_catalog")
     b.adjust(2, 1, 2)
     await show_screen(call, prod["image_name"], caption, b.as_markup())
 
 
 @router.callback_query(F.data == "pay_sbp_soon")
 async def cb_sbp_soon(call: CallbackQuery):
-    await call.answer(
+    await _quick_answer(
+        call,
         "⏳ Оплата по СБП в скором времени будет добавлена!\n"
         "Сейчас доступны DonationAlerts и Криптовалюта.",
         show_alert=True
     )
 
 
-@router.callback_query(F.data.startswith("pay_"))
+@router.callback_query(F.data.startswith("pay_da_") | F.data.startswith("pay_crypto_"))
 async def cb_pay(call: CallbackQuery, state: FSMContext):
+    asyncio.create_task(_quick_answer(call))
     parts = call.data.split("_")
-    method, pid = parts[1], int(parts[2])
+    try:
+        method, pid = parts[1], int(parts[2])
+    except (IndexError, ValueError):
+        return await _quick_answer(call, "Ошибка товара", show_alert=True)
+
     prod = RAM_PRODS.get(pid)
     if not prod:
-        return await call.answer("Товар не найден", show_alert=True)
+        return await _quick_answer(call, "Товар не найден", show_alert=True)
 
     m_name = "DonationAlerts" if method == "da" else "Криптовалюта"
-    cur = await DB_CONN.execute(
-        "INSERT INTO orders (user_id, product_name, price, pay_method, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-        (call.from_user.id, prod["full_name"], prod["price"], m_name, datetime.now().strftime("%d.%m.%Y %H:%M"))
-    )
-    order_id = cur.lastrowid
-    await DB_CONN.commit()
+    async with DB_LOCK:
+        async with DB_CONN.execute(
+            "INSERT INTO orders (user_id, product_name, price, pay_method, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
+            (call.from_user.id, prod["full_name"], prod["price"], m_name, datetime.now().strftime("%d.%m.%Y %H:%M"))
+        ) as cur:
+            order_id = cur.lastrowid
+        await DB_CONN.commit()
 
     await state.update_data(order_id=order_id, fname=prod["full_name"], price=prod["price"], pid=pid)
     pay_info = PAYMENT_DA_TEXT if method == "da" else PAYMENT_CRYPTO_TEXT
@@ -1479,7 +1712,7 @@ async def cb_pay(call: CallbackQuery, state: FSMContext):
     caption = (
         f"🧾 <b>Счет на оплату • Заказ #{order_id}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💎 Товар: <b>{prod['full_name']}</b>\n"
+        f"💎 Товар: <b>{html.escape(prod['full_name'])}</b>\n"
         f"💰 К оплате: <b><code>{prod['price']:.0f} ₽</code></b>\n\n"
         f"{pay_info}"
     )
@@ -1487,7 +1720,7 @@ async def cb_pay(call: CallbackQuery, state: FSMContext):
     buttons = []
     if method == "da":
         buttons.append([InlineKeyboardButton(text="🧡 Перейти к оплате (DonationAlerts)", url=DONATIONALERTS_URL)])
-    buttons.append([InlineKeyboardButton(text="📸 Отправить чек", callback_data=f"sendcheck_{order_id}")])
+    buttons.append([InlineKeyboardButton(text="📸 Отправить чек", callback_data=f"sendcheck_{order_id}_{pid}")])
     buttons.append([
         InlineKeyboardButton(text="⬅️ Назад", callback_data=f"prod_{pid}"),
         InlineKeyboardButton(text="❌ Отмена", callback_data=f"cat_{prod['category_id']}")
@@ -1499,30 +1732,58 @@ async def cb_pay(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("sendcheck_"))
 async def cb_sendcheck(call: CallbackQuery, state: FSMContext):
     asyncio.create_task(_quick_answer(call))
+    parts = call.data.split("_")
     data = await state.get_data()
-    pid = data.get("pid", 1)
+
+    try:
+        order_id = int(parts[1])
+    except (IndexError, ValueError):
+        order_id = data.get("order_id", 0)
+
+    try:
+        pid = int(parts[2])
+    except (IndexError, ValueError):
+        pid = data.get("pid", 1)
+
+    fname = data.get("fname")
+    price = data.get("price")
+
+    # Если бот перезапускался, восстанавливаем данные заказа из БД
+    if (not fname or price is None) and order_id:
+        async with DB_CONN.execute("SELECT product_name, price FROM orders WHERE id = ?", (order_id,)) as cur:
+            row = await cur.fetchone()
+            if row:
+                fname, price = row
+
+    await state.update_data(order_id=order_id, fname=fname or "Товар", price=price or 0, pid=pid)
     await state.set_state(OrderFlow.waiting_receipt)
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад к оплате", callback_data=f"prod_{pid}")]
+        [
+            InlineKeyboardButton(text="⬅️ К товару", callback_data=f"prod_{pid}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="nav_home")
+        ]
     ])
     await call.message.answer(
-        "📸 <b>Прикрепите скриншот чека об оплате в этот чат.</b>\n"
-        "<i>В подписи к фото вы можете сразу указать игровой ID, UID, тег или почту для быстрого выполнения заказа.</i>",
+        f"📸 <b>Прикрепите скриншот или файл чека по заказу #{order_id} в этот чат.</b>\n"
+        "<i>В подписи к файлу вы можете сразу указать игровой ID, UID, тег или почту для быстрого выполнения заказа.</i>",
         reply_markup=kb
     )
 
 
-@router.message(OrderFlow.waiting_receipt, F.photo)
+@router.message(OrderFlow.waiting_receipt, F.photo | F.document)
 async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     order_id = data.get("order_id", 0)
     fname = data.get("fname", "Товар")
     price = data.get("price", 0)
-    comment = message.caption or "Без комментария"
+    comment = html.escape(message.caption or "Без комментария")
     await state.clear()
 
-    await DB_CONN.execute("UPDATE orders SET status = 'checking' WHERE id = ?", (order_id,))
-    await DB_CONN.commit()
+    if order_id:
+        async with DB_LOCK:
+            await DB_CONN.execute("UPDATE orders SET status = 'checking' WHERE id = ?", (order_id,))
+            await DB_CONN.commit()
 
     adm_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -1530,19 +1791,23 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_no_{order_id}_{message.from_user.id}")
         ]
     ])
-    await bot.send_photo(
-        chat_id=ADMIN_ID,
-        photo=message.photo[-1].file_id,
-        caption=(
-            f"🔔 <b>Новый чек • Заказ #{order_id}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 Клиент: @{message.from_user.username or 'без_ника'} (<code>{message.from_user.id}</code>)\n"
-            f"💎 Товар: <b>{fname}</b>\n"
-            f"💰 Сумма: <b>{price:.0f} ₽</b>\n"
-            f"💬 Комментарий: <blockquote>{comment}</blockquote>"
-        ),
-        reply_markup=adm_kb
+    safe_user = html.escape(message.from_user.username or "без_ника")
+    adm_caption = (
+        f"🔔 <b>Новый чек • Заказ #{order_id}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Клиент: @{safe_user} (<code>{message.from_user.id}</code>)\n"
+        f"💎 Товар: <b>{html.escape(str(fname))}</b>\n"
+        f"💰 Сумма: <b>{price:.0f} ₽</b>\n"
+        f"💬 Комментарий: <blockquote>{comment}</blockquote>"
     )
+
+    try:
+        if message.photo:
+            await bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=adm_caption, reply_markup=adm_kb)
+        else:
+            await bot.send_document(chat_id=ADMIN_ID, document=message.document.file_id, caption=adm_caption, reply_markup=adm_kb)
+    except Exception as e:
+        logging.error(f"Не удалось переслать чек #{order_id} администратору: {e}")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -1559,53 +1824,74 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
 
 @router.message(OrderFlow.waiting_receipt)
 async def wrong_receipt(message: Message):
-    await message.answer("⚠️ Пожалуйста, отправьте <b>скриншот или фотографию</b> чека.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить отправку чека", callback_data="nav_home")]
+    ])
+    await message.answer("⚠️ Пожалуйста, отправьте <b>скриншот, фотографию или файл</b> чека.", reply_markup=kb)
 
 
 # ================= АДМИН-ПАНЕЛЬ =================
 @router.callback_query(F.data.startswith("adm_ok_"))
 async def cb_adm_ok(call: CallbackQuery, bot: Bot):
     if call.from_user.id != ADMIN_ID:
-        return
+        return await _quick_answer(call)
     _, _, oid_s, uid_s = call.data.split("_")
     oid, uid = int(oid_s), int(uid_s)
 
-    await DB_CONN.execute("UPDATE orders SET status = 'completed' WHERE id = ?", (oid,))
-    await DB_CONN.commit()
+    async with DB_LOCK:
+        await DB_CONN.execute("UPDATE orders SET status = 'completed' WHERE id = ?", (oid,))
+        await DB_CONN.commit()
 
-    await bot.send_message(
-        chat_id=uid,
-        text=(
-            f"🎉 <b>Оплата по заказу #{oid} подтверждена!</b>\n"
-            "Ваш заказ принят к выдаче. При необходимости уточнения данных администратор свяжется с вами в ЛС.\n"
-            "💜 Спасибо за покупку в <b>Bombych Store</b>!"
+    try:
+        await bot.send_message(
+            chat_id=uid,
+            text=(
+                f"🎉 <b>Оплата по заказу #{oid} подтверждена!</b>\n"
+                "Ваш заказ принят к выдаче. При необходимости уточнения данных администратор свяжется с вами в ЛС.\n"
+                "💜 Спасибо за покупку в <b>Bombych Store</b>!"
+            )
         )
-    )
-    await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ <b>ВЫПОЛНЕНО</b>")
-    await call.answer("Заказ подтвержден!")
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить клиента {uid} о заказе #{oid}: {e}")
+
+    try:
+        await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ <b>ВЫПОЛНЕНО</b>")
+    except Exception:
+        pass
+    await _quick_answer(call, "Заказ подтвержден!")
 
 
 @router.callback_query(F.data.startswith("adm_no_"))
 async def cb_adm_no(call: CallbackQuery, bot: Bot):
     if call.from_user.id != ADMIN_ID:
-        return
+        return await _quick_answer(call)
     _, _, oid_s, uid_s = call.data.split("_")
     oid, uid = int(oid_s), int(uid_s)
 
-    await DB_CONN.execute("UPDATE orders SET status = 'rejected' WHERE id = ?", (oid,))
-    await DB_CONN.commit()
+    async with DB_LOCK:
+        await DB_CONN.execute("UPDATE orders SET status = 'rejected' WHERE id = ?", (oid,))
+        await DB_CONN.commit()
 
-    await bot.send_message(
-        chat_id=uid,
-        text=f"❌ <b>Заказ #{oid} отклонен.</b>\nОплата не найдена. Проверьте чек или обратитесь в поддержку."
-    )
-    await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n❌ <b>ОТКЛОНЕНО</b>")
-    await call.answer("Отклонено.")
+    try:
+        await bot.send_message(
+            chat_id=uid,
+            text=f"❌ <b>Заказ #{oid} отклонен.</b>\nОплата не найдена. Проверьте чек или обратитесь в поддержку."
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить клиента {uid} об отказе #{oid}: {e}")
+
+    try:
+        await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n❌ <b>ОТКЛОНЕНО</b>")
+    except Exception:
+        pass
+    await _quick_answer(call, "Отклонено.")
 
 
 @router.message(Command("admin"))
 @router.message(F.text.in_({"⚙️ Админка", "⚙️ Админ-панель"}))
-async def msg_admin(message: Message):
+async def msg_admin(message: Message, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
     if message.from_user.id == ADMIN_ID:
         await render_admin(message)
 
@@ -1616,12 +1902,15 @@ async def cb_admin(call: CallbackQuery, state: FSMContext):
         await state.clear()
     if call.from_user.id == ADMIN_ID:
         await render_admin(call)
+    else:
+        await _quick_answer(call)
 
 
 async def render_admin(target):
-    u_cnt = (await (await DB_CONN.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
-    o_cnt = (await (await DB_CONN.execute("SELECT COUNT(*) FROM orders WHERE status = 'completed'")).fetchone())[0]
-    rev = (await (await DB_CONN.execute("SELECT COALESCE(SUM(price), 0) FROM orders WHERE status = 'completed'")).fetchone())[0]
+    async with DB_CONN.execute("SELECT COUNT(*) FROM users") as cur:
+        u_cnt = (await cur.fetchone())[0]
+    async with DB_CONN.execute("SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE status = 'completed'") as cur:
+        o_cnt, rev = await cur.fetchone()
 
     text = (
         "⚙️ <b>Панель управления • Bombych Store</b>\n"
@@ -1643,11 +1932,12 @@ async def render_admin(target):
 @router.callback_query(F.data == "adm_add_item")
 async def cb_adm_add_item(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
-        return
+        return await _quick_answer(call)
     asyncio.create_task(_quick_answer(call))
     b = InlineKeyboardBuilder()
     for cid in RAM_CAT_ORDER:
-        b.button(text=RAM_CATS[cid]["short_name"], callback_data=f"admcat_{cid}")
+        label = f"FN: {RAM_CATS[cid]['short_name']}" if cid in FORTNITE_CAT_IDS else RAM_CATS[cid]["short_name"]
+        b.button(text=label, callback_data=f"admcat_{cid}")
     b.adjust(2)
     b.row(InlineKeyboardButton(text="⬅️ Отмена", callback_data="nav_admin"))
     await call.message.answer("📂 <b>Выберите категорию для нового товара:</b>", reply_markup=b.as_markup())
@@ -1655,6 +1945,8 @@ async def cb_adm_add_item(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admcat_"))
 async def cb_adm_pick_cat(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return await _quick_answer(call)
     asyncio.create_task(_quick_answer(call))
     cid = int(call.data.split("_")[1])
     await state.update_data(cid=cid)
@@ -1664,28 +1956,28 @@ async def cb_adm_pick_cat(call: CallbackQuery, state: FSMContext):
 
 @router.message(AdminFlow.add_full_name)
 async def adm_set_fname(message: Message, state: FSMContext):
-    await state.update_data(fname=message.text.strip())
+    await state.update_data(fname=(message.text or "").strip())
     await state.set_state(AdminFlow.add_short_btn)
     await message.answer("🔘 Введите <b>короткое название для кнопки</b> до 10 символов (например: <code>💎 4500 ВБ</code>):")
 
 
 @router.message(AdminFlow.add_short_btn)
 async def adm_set_sbtn(message: Message, state: FSMContext):
-    await state.update_data(sbtn=message.text.strip())
+    await state.update_data(sbtn=(message.text or "").strip())
     await state.set_state(AdminFlow.add_price)
     await message.answer("💰 Введите <b>цену в рублях</b> (бот сам сделает скидку -20%, либо введите две цены через пробел: <code>старая новая</code>):")
 
 
 @router.message(AdminFlow.add_price)
 async def adm_save_product(message: Message, state: FSMContext):
-    parts = message.text.replace(",", ".").split()
+    parts = (message.text or "").replace(",", ".").split()
     try:
         if len(parts) >= 2:
             old_p, new_p = int(float(parts[0])), int(float(parts[1]))
         else:
             old_p = int(float(parts[0]))
             new_p = max(10, int(round(old_p * 0.80)))
-    except ValueError:
+    except (ValueError, IndexError):
         return await message.answer("⚠️ Введите число (например <code>500</code> или <code>500 400</code>):")
 
     data = await state.get_data()
@@ -1693,23 +1985,24 @@ async def adm_save_product(message: Message, state: FSMContext):
 
     cimg = RAM_CATS.get(data["cid"], {}).get("image_name", "catalog.jpg")
     btn_lbl = f"{data['sbtn']} • {new_p}₽"
-    await DB_CONN.execute(
-        "INSERT INTO products (category_id, full_name, btn_label, old_price, price, image_name) VALUES (?, ?, ?, ?, ?, ?)",
-        (data["cid"], data["fname"], btn_lbl, old_p, new_p, cimg)
-    )
-    await DB_CONN.commit()
+    async with DB_LOCK:
+        await DB_CONN.execute(
+            "INSERT INTO products (category_id, full_name, btn_label, old_price, price, image_name) VALUES (?, ?, ?, ?, ?, ?)",
+            (data["cid"], data["fname"], btn_lbl, old_p, new_p, cimg)
+        )
+        await DB_CONN.commit()
     await reload_catalog_cache()
 
     await message.answer(
-        f"✅ Товар <b>{data['fname']}</b> добавлен!\n"
-        f"Цена: <s>{old_p}₽</s> → <b>{new_p}₽</b> (Кнопка: <code>{btn_lbl}</code>)"
+        f"✅ Товар <b>{html.escape(data['fname'])}</b> добавлен!\n"
+        f"Цена: <s>{old_p}₽</s> → <b>{new_p}₽</b> (Кнопка: <code>{html.escape(btn_lbl)}</code>)"
     )
 
 
 @router.callback_query(F.data == "adm_broadcast")
 async def cb_broadcast(call: CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
-        return
+        return await _quick_answer(call)
     asyncio.create_task(_quick_answer(call))
     await state.set_state(AdminFlow.waiting_broadcast)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="nav_admin")]])
@@ -1719,15 +2012,26 @@ async def cb_broadcast(call: CallbackQuery, state: FSMContext):
 @router.message(AdminFlow.waiting_broadcast)
 async def run_broadcast(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
-    users = await (await DB_CONN.execute("SELECT user_id FROM users")).fetchall()
+    async with DB_CONN.execute("SELECT user_id FROM users") as cur:
+        users = await cur.fetchall()
+    safe_text = html.escape(message.text or "")
     sent = 0
     for (uid,) in users:
         try:
-            await bot.send_message(uid, f"📢 <b>Новости • Bombych Store</b>\n\n{message.text}")
+            await bot.send_message(uid, f"📢 <b>Новости • Bombych Store</b>\n\n{safe_text}")
             sent += 1
+            await asyncio.sleep(0.05)
         except Exception:
             pass
     await message.answer(f"✅ Рассылка доставлена <b>{sent}</b> клиентам.")
+
+
+# ================= ГЛОБАЛЬНЫЙ ПЕРЕХВАТЧИК ОШИБОК =================
+@router.error()
+async def global_error_handler(event: ErrorEvent):
+    logging.exception(f"Необработанная ошибка в апдейте: {event.exception}")
+    if event.update.callback_query:
+        await _quick_answer(event.update.callback_query, "⚠️ Произошла временная ошибка, попробуйте ещё раз.")
 
 
 # ================= МЕНЮ «☰» И ЗАПУСК =================
@@ -1751,20 +2055,22 @@ async def main():
     prepare_all_banners()
     await init_db_and_cache()
 
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    session = AiohttpSession(timeout=25)
+    bot = Bot(token=BOT_TOKEN, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await setup_menu_commands(bot)
 
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Bombych Store v11 успешно запущен!")
+    logging.info("Bombych Store v12 успешно запущен!")
     try:
         await dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),
-            polling_timeout=30
+            polling_timeout=25
         )
     finally:
+        await bot.session.close()
         if DB_CONN:
             await DB_CONN.close()
 
