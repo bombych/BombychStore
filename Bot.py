@@ -5,8 +5,9 @@ import math
 import os
 import random
 import shutil
-import sys
 import subprocess
+import sys
+import urllib.request
 from datetime import datetime
 
 try:
@@ -31,16 +32,19 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= НАСТРОЙКИ =================
-# Токен берется автоматически из вкладки «Токен» / «Переменные» на хостинге (безопасно для публичного GitHub)
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or "6829445274:AAE-hNYRr-uEh7cZCruhaBySlLVFWYUn34o"
+# Токен автоматически берётся из вкладки «Переменные» / «Токен» на хостинге
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or ""
 ADMIN_ID = 5157852376
 SUPPORT_LINK = "https://t.me/bombystore_bot"  # Замени на свой @username поддержки
 DONATIONALERTS_URL = "https://www.donationalerts.com/r/bombychyt"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.getenv("DATA_DIR") or BASE_DIR
+os.makedirs(DATA_DIR, exist_ok=True)
+
 CURRENT_DB_NAME = "bombystore_v10.db"
-DB_PATH = os.path.join(BASE_DIR, CURRENT_DB_NAME)
-IMG_DIR = os.path.join(BASE_DIR, "assets_v10")
+DB_PATH = os.path.join(DATA_DIR, CURRENT_DB_NAME)
+IMG_DIR = os.path.join(BASE_DIR, "assets_v11")
 
 PAYMENT_DA_TEXT = (
     "🧡 <b>Оплата через DonationAlerts:</b>\n"
@@ -325,13 +329,13 @@ CATEGORIES_DATA = [
     ),
 ]
 
-# Оригинальные картинки из корня проекта или папки img/ (подхватываются автоматически, не удаляются)
+# Оригинальные файлы пользователя из папки img/ или корня (подхватываются без учёта регистра)
 USER_UPLOADED_MAP = {
-    "main.jpg": ["4.jpg", "avatar.jpg", "avatar.png", "main.jpg", "main.png"],
+    "avatar.jpg": ["4.jpg", "avatar.jpg", "avatar.png"],
     "logo.jpg": ["4.jpg", "logo.jpg", "logo.png"],
-    "vbucks.jpg": ["1 (1).jpg", "1.jpg", "1_3.jpg", "vbucks.jpg", "vbucks.png"],
+    "vbucks.jpg": ["1 (1).jpg", "1_3.jpg", "vbucks.jpg", "vbucks.png"],
     "gift_vbucks.jpg": ["xs1.jpg", "gift_vbucks.jpg", "gift_vbucks.png"],
-    "nitro.jpg": ["1_2.jpg", "nitro.jpg", "nitro.png"],
+    "nitro.jpg": ["1.jpg", "1_2.jpg", "nitro.jpg", "nitro.png"],
     "tg_prem.jpg": ["-1.png", "tg_prem.png", "tg_prem.jpg"],
     "exitlag.jpg": ["891.jpg", "exitlag.jpg", "exitlag.png"],
     "info.jpg": ["information.png", "info.png", "info.jpg"],
@@ -349,7 +353,7 @@ SERVICE_BANNERS = [
 
 # ================= АВТООЧИСТКА СТАРЫХ ПАПОК, БАННЕРОВ И БД =================
 def cleanup_old_files():
-    """Удаляет устаревшие сгенерированные папки (assets_v*, img_v*) и старые БД. Папку img/ НЕ трогает."""
+    """Удаляет сгенерированные папки (assets_v*, img_v*) и старые БД. Папку img/ НЕ трогает."""
     removed_items = []
 
     for pattern in ("img_v*", "assets_v*"):
@@ -359,16 +363,17 @@ def cleanup_old_files():
                 removed_items.append(os.path.basename(folder_path))
 
     keep_prefixes = (CURRENT_DB_NAME,)
-    for pattern in ("bombystore.db*", "bombystore_v*.db*", "shop.db*", "bot.db*"):
-        for db_file in glob.glob(os.path.join(BASE_DIR, pattern)):
-            fname = os.path.basename(db_file)
-            if any(fname.startswith(pref) for pref in keep_prefixes):
-                continue
-            try:
-                os.remove(db_file)
-                removed_items.append(fname)
-            except OSError:
-                pass
+    for search_dir in {BASE_DIR, DATA_DIR}:
+        for pattern in ("bombystore.db*", "bombystore_v*.db*", "shop.db*", "bot.db*"):
+            for db_file in glob.glob(os.path.join(search_dir, pattern)):
+                fname = os.path.basename(db_file)
+                if any(fname.startswith(pref) for pref in keep_prefixes):
+                    continue
+                try:
+                    os.remove(db_file)
+                    removed_items.append(fname)
+                except OSError:
+                    pass
 
     if removed_items:
         logging.info(f"Автоочистка выполнена. Удалено: {', '.join(removed_items)}")
@@ -475,7 +480,8 @@ THEME_PALETTES = {
 }
 
 
-def _find_user_file(filenames: list):
+def _find_user_file(filenames: list) -> str | None:
+    """Ищет файл в img/, images/, корне проекта (без учёта регистра на Linux)."""
     home = os.path.expanduser("~")
     dirs = [
         os.path.join(BASE_DIR, "img"),
@@ -484,12 +490,45 @@ def _find_user_file(filenames: list):
         os.path.join(home, "Downloads"),
         os.path.join(home, "Desktop"),
     ]
+    lower_targets = [fn.lower() for fn in filenames]
     for d in dirs:
-        if os.path.exists(d):
-            for fn in filenames:
-                p = os.path.join(d, fn)
-                if os.path.exists(p):
-                    return p
+        if not os.path.isdir(d):
+            continue
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        entries_map = {e.lower(): e for e in entries}
+        for target in lower_targets:
+            if target in entries_map:
+                full_path = os.path.join(d, entries_map[target])
+                if os.path.isfile(full_path):
+                    return full_path
+    return None
+
+
+def _download_fallback_font() -> str | None:
+    fallback_path = os.path.join("/tmp", "BombychFont-Bold.ttf")
+    if os.path.exists(fallback_path) and os.path.getsize(fallback_path) > 10000:
+        return fallback_path
+
+    urls = [
+        "https://github.com/google/fonts/raw/main/apache/roboto/static/Roboto-Bold.ttf",
+        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
+    ]
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = resp.read()
+            if len(data) > 10000:
+                os.makedirs("/tmp", exist_ok=True)
+                with open(fallback_path, "wb") as f:
+                    f.write(data)
+                ImageFont.truetype(fallback_path, 48)
+                return fallback_path
+        except Exception:
+            continue
     return None
 
 
@@ -499,21 +538,43 @@ def _resolve_font_path() -> str | None:
         return _RESOLVED_FONT_PATH
     _FONT_SEARCHED = True
 
-    # 1. Ищем шрифт прямо в папке img/ или корне репозитория (например, impact.ttf)
-    local_dirs = [os.path.join(BASE_DIR, "img"), os.path.join(BASE_DIR, "images"), BASE_DIR]
+    # 1. Ищем шрифт в img/, images/ и корне проекта (без учёта регистра)
+    local_dirs = [
+        os.path.join(BASE_DIR, "img"),
+        os.path.join(BASE_DIR, "images"),
+        BASE_DIR,
+    ]
+    preferred_names = ("impact.ttf", "arialbd.ttf", "font.ttf")
     for d in local_dirs:
-        if os.path.isdir(d):
-            for pref in ("impact.ttf", "Impact.ttf", "arialbd.ttf", "font.ttf"):
-                p = os.path.join(d, pref)
-                if os.path.exists(p):
+        if not os.path.isdir(d):
+            continue
+        try:
+            files = os.listdir(d)
+        except OSError:
+            continue
+        files_map = {f.lower(): f for f in files}
+        for pref in preferred_names:
+            if pref in files_map:
+                p = os.path.join(d, files_map[pref])
+                try:
+                    ImageFont.truetype(p, 48)
                     _RESOLVED_FONT_PATH = p
+                    logging.info(f"Шрифт загружен из проекта: {p}")
                     return p
-            for f in os.listdir(d):
-                if f.lower().endswith((".ttf", ".otf")):
-                    _RESOLVED_FONT_PATH = os.path.join(d, f)
-                    return _RESOLVED_FONT_PATH
+                except Exception:
+                    pass
+        for f in files:
+            if f.lower().endswith((".ttf", ".otf")):
+                p = os.path.join(d, f)
+                try:
+                    ImageFont.truetype(p, 48)
+                    _RESOLVED_FONT_PATH = p
+                    logging.info(f"Шрифт загружен из проекта: {p}")
+                    return p
+                except Exception:
+                    pass
 
-    # 2. Стандартные системные шрифты Windows и Linux
+    # 2. Стандартные системные шрифты Windows / Linux
     font_candidates = [
         "C:\\Windows\\Fonts\\impact.ttf",
         "C:\\Windows\\Fonts\\arialbd.ttf",
@@ -523,10 +584,15 @@ def _resolve_font_path() -> str | None:
     ]
     for p in font_candidates:
         if os.path.exists(p):
-            _RESOLVED_FONT_PATH = p
-            return p
+            try:
+                ImageFont.truetype(p, 48)
+                _RESOLVED_FONT_PATH = p
+                logging.info(f"Системный шрифт загружен: {p}")
+                return p
+            except Exception:
+                pass
 
-    # 3. Автопоиск любых .ttf/.otf шрифтов в Linux (сначала жирные, потом обычные)
+    # 3. Автопоиск любых .ttf/.otf шрифтов в Linux
     bold_found = []
     any_found = []
     for search_root in ("/usr/share/fonts", "/usr/local/share/fonts"):
@@ -545,10 +611,19 @@ def _resolve_font_path() -> str | None:
         try:
             ImageFont.truetype(p, 48)
             _RESOLVED_FONT_PATH = p
+            logging.info(f"Найден шрифт Linux: {p}")
             return p
         except Exception:
             continue
 
+    # 4. Резервная загрузка шрифта с кириллицей
+    downloaded = _download_fallback_font()
+    if downloaded:
+        _RESOLVED_FONT_PATH = downloaded
+        logging.info(f"Загружен резервный шрифт: {downloaded}")
+        return downloaded
+
+    logging.warning("TTF-шрифты не найдены, используется встроенный шрифт Pillow.")
     return None
 
 
@@ -814,7 +889,7 @@ def prepare_all_banners():
     lp = _find_user_file(USER_UPLOADED_MAP["logo.jpg"])
     logo_img = Image.open(lp).convert("RGBA") if lp else _make_fallback_logo()
 
-    # 1. Подключаем оригинальные файлы пользователя из папки img/ или корня
+    # 1. Подключаем оригинальные картинки пользователя из папки img/
     for target, candidates in USER_UPLOADED_MAP.items():
         if target != "logo.jpg":
             dest = os.path.join(IMG_DIR, target)
@@ -822,7 +897,12 @@ def prepare_all_banners():
             if found:
                 Image.open(found).convert("RGB").save(dest, "JPEG", quality=90, optimize=True)
 
-    # 2. Категории: берём готовый файл из img/, если его нет — генерируем сцену
+    # Гарантируем наличие аватарки для приветствия
+    avatar_dest = os.path.join(IMG_DIR, "avatar.jpg")
+    if not os.path.exists(avatar_dest):
+        logo_img.convert("RGB").save(avatar_dest, "JPEG", quality=90, optimize=True)
+
+    # 2. Категории: берём готовый файл из img/, иначе генерируем сцену
     for _, _, _, img_name, theme, (t1, t2), _, _ in CATEGORIES_DATA:
         dest = os.path.join(IMG_DIR, img_name)
         if not os.path.exists(dest):
@@ -832,7 +912,7 @@ def prepare_all_banners():
             else:
                 generate_scenic_banner(dest, logo_img, theme, t1, t2)
 
-    # 3. Сервисные баннеры (main.jpg уже взят из аватарки 4.jpg, если она загружена)
+    # 3. Сервисные баннеры
     for img_name, theme, (t1, t2) in SERVICE_BANNERS:
         dest = os.path.join(IMG_DIR, img_name)
         if not os.path.exists(dest):
@@ -898,6 +978,7 @@ async def init_db_and_cache():
         )
     """)
 
+    # Сбрасываем кэш file_id при каждом запуске, чтобы Telegram сразу показал свежие картинки
     await DB_CONN.execute("DELETE FROM media_cache")
     PHOTO_CACHE.clear()
 
@@ -1153,7 +1234,20 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await register_user(message.from_user)
     kb = HOME_KB_ADMIN if message.from_user.id == ADMIN_ID else HOME_KB_USER
-    await message.answer("💜 <b>Добро пожаловать в официальный магазин Bombych Store!</b>", reply_markup=reply_main_kb(message.from_user.id))
+
+    # Приветствие сразу с твоей аватаркой 4.jpg
+    avatar_fid = PHOTO_CACHE.get("avatar.jpg")
+    avatar_media = avatar_fid or FSInputFile(os.path.join(IMG_DIR, "avatar.jpg"))
+    welcome_msg = await message.answer_photo(
+        photo=avatar_media,
+        caption="💜 <b>Добро пожаловать в официальный магазин Bombych Store!</b>",
+        reply_markup=reply_main_kb(message.from_user.id)
+    )
+    if not avatar_fid and welcome_msg.photo:
+        fid = welcome_msg.photo[-1].file_id
+        PHOTO_CACHE["avatar.jpg"] = fid
+        asyncio.create_task(_save_file_id_bg("avatar.jpg", fid))
+
     await show_screen(message, "main.jpg", HOME_TEXT, kb)
 
 
@@ -1652,7 +1746,7 @@ async def setup_menu_commands(bot: Bot):
 
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Не найден BOT_TOKEN! Укажите токен бота во вкладке «Токен» на хостинге.")
+        raise RuntimeError("Не найден BOT_TOKEN! Укажите токен бота во вкладке «Переменные» на хостинге.")
 
     prepare_all_banners()
     await init_db_and_cache()
@@ -1663,7 +1757,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Bombych Store v10 успешно запущен!")
+    logging.info("Bombych Store v11 успешно запущен!")
     try:
         await dp.start_polling(
             bot,
