@@ -53,7 +53,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 CURRENT_DB_NAME = "bombystore_v10.db"
 DB_PATH = os.path.join(DATA_DIR, CURRENT_DB_NAME)
-IMG_DIR = os.path.join(BASE_DIR, "assets_v14")
+IMG_DIR = os.path.join(BASE_DIR, "assets_v15")
 CATALOG_SCHEMA_VERSION = "v12_fortnite_folder"
 
 FORTNITE_CAT_IDS = (1, 2, 3)
@@ -84,7 +84,10 @@ LAST_SCREEN_IMG: dict[tuple[int, int], str] = {}
 AUX_MSGS: dict[tuple[int, int], list[int]] = {}
 
 PHOTO_CACHE: dict[str, str] = {}
+DOC_CACHE: dict[str, str] = {}
+DOC_META: dict[str, dict[str, str]] = {}
 FILE_HASHES: dict[str, str] = {}
+
 KNOWN_USERS: set[int] = set()
 ACCEPTED_USERS: set[int] = set()
 _RESOLVED_FONT_PATH: str | None = None
@@ -375,6 +378,107 @@ SERVICE_BANNERS = [
     ("privacy.jpg", "cyan_night", ("ПОЛИТИКА", "КОНФИДЕНЦИАЛЬНОСТИ")),
 ]
 
+# ================= СОДЕРЖИМОЕ ЮРИДИЧЕСКИХ ДОКУМЕНТОВ (ДЛЯ ФАЙЛОВ) =================
+TERMS_SECTIONS = [
+    (
+        "1. Общие положения",
+        [
+            "1.1. Настоящее Пользовательское соглашение (далее — Соглашение) регулирует отношения между администрацией Telegram-бота Bombych Store (далее — Сервис) и физическим лицом, использующим Сервис (далее — Пользователь).",
+            "1.2. Нажимая кнопку «Принимаю условия» при первом входе и продолжая использование Сервиса, Пользователь подтверждает полное и безоговорочное согласие со всеми условиями настоящего Соглашения.",
+            "1.3. Пользователь подтверждает достижение возраста 18 лет либо наличие согласия родителей или иных законных представителей на совершение покупок в Сервисе."
+        ]
+    ),
+    (
+        "2. Предмет соглашения",
+        [
+            "2.1. Сервис оказывает информационно-посреднические услуги по приобретению и зачислению цифровых товаров: игровой валюты, внутриигровых наборов, цифровых ключей активации и подписок.",
+            "2.2. Сервис является независимой торговой площадкой и не аффилирован с компаниями Epic Games, Supercell, Valve, Telegram, Discord, Roblox, miHoYo, Krafton, Microsoft, Sony и иными правообладателями."
+        ]
+    ),
+    (
+        "3. Порядок оформления и оплаты заказов",
+        [
+            "3.1. Актуальный перечень товаров и стоимость указаны в каталоге Сервиса и могут изменяться администрацией без предварительного уведомления. Для уже оплаченных заказов цена фиксируется на момент оплаты.",
+            "3.2. Оплата производится по реквизитам, выданным Сервисом в счёте на оплату. После перевода средств Пользователь прикрепляет скриншот или файл чека в бот.",
+            "3.3. Заказ принимается в работу только после проверки администратором фактического поступления оплаты."
+        ]
+    ),
+    (
+        "4. Сроки выдачи и условия возврата",
+        [
+            "4.1. Приём заявок в боте осуществляется круглосуточно (24/7). Обработка заказов и выдача цифровых товаров производятся в рабочие часы: ежедневно с 05:00 до 22:00 по московскому времени (МСК).",
+            "4.2. Цифровые товары, ключи активации, подписки и внутриигровые зачисления надлежащего качества после фактической передачи или активации возврату и обмену не подлежат.",
+            "4.3. В случае невозможности выполнения оплаченного заказа по вине Сервиса Пользователю осуществляется полный возврат уплаченной суммы по согласованным реквизитам."
+        ]
+    ),
+    (
+        "5. Права, обязанности и ограничения",
+        [
+            "5.1. Пользователь несёт полную ответственность за достоверность предоставляемых данных (игровой ID, UID, @username, регион аккаунта, корректная привязка Xbox / Supercell ID и иные сведения).",
+            "5.2. В случае указания Пользователем ошибочных реквизитов, повлекших зачисление товара на иной аккаунт, услуга считается оказанной надлежащим образом и возврату не подлежит.",
+            "5.3. Запрещается отправка поддельных чеков, спам, попытки нарушения работы Сервиса, а также оскорбления в адрес поддержки. При выявлении нарушений администрация вправе ограничить доступ к боту.",
+            "5.4. Сервис не несёт ответственности за временные технические сбои платёжных систем, мессенджера Telegram, игровых серверов, а также за ограничения, применяемые правообладателями игр."
+        ]
+    ),
+    (
+        "6. Заключительные положения",
+        [
+            "6.1. Администрация оставляет за собой право вносить изменения в настоящее Соглашение. Актуальная версия документа всегда доступна в соответствующем разделе бота.",
+            f"6.2. По всем вопросам, связанным с работой Сервиса, заказами и условиями настоящего Соглашения, обращайтесь к нам в поддержку Telegram: {SUPPORT_USERNAME}."
+        ]
+    ),
+]
+
+PRIVACY_SECTIONS = [
+    (
+        "1. Общие положения",
+        [
+            "1.1. Настоящая Политика конфиденциальности определяет порядок сбора, хранения, обработки, защиты и удаления персональных данных пользователей Telegram-бота Bombych Store (далее — Сервис).",
+            "1.2. Обработка данных осуществляется с соблюдением принципов конфиденциальности и безопасности, соответствующих базовым требованиям ФЗ № 152-ФЗ «О персональных данных».",
+            "1.3. Нажимая кнопку согласия при первом запуске бота, Пользователь подтверждает своё согласие с условиями настоящей Политики."
+        ]
+    ),
+    (
+        "2. Состав собираемых данных",
+        [
+            "• Технические данные Telegram: уникальный идентификатор (Telegram ID), имя пользователя (@username), отображаемое имя профиля и дата первого обращения в бот.",
+            "• Сведения о заказах: наименования выбранных позиций, суммы, выбранный способ оплаты, статусы обработки, прикреплённые чеки и комментарии к заказам.",
+            "• Сведения для зачисления товара: игровой ID, UID, тег, электронная почта или временные реквизиты доступа, добровольно переданные Пользователем исключительно для выполнения конкретного заказа."
+        ]
+    ),
+    (
+        "3. Цели обработки персональных данных",
+        [
+            "• Регистрация и идентификация Пользователя в Сервисе, отображение личного кабинета и истории покупок.",
+            "• Проверка факта оплаты, выполнение и доставка оплаченных цифровых товаров и услуг.",
+            "• Оказание технической поддержки и разрешение спорных ситуаций по заказам.",
+            "• Направление сервисных уведомлений о статусе заказов, а также новостей и акций Сервиса."
+        ]
+    ),
+    (
+        "4. Хранение и защита данных",
+        [
+            "4.1. Технические данные профиля и история заказов хранятся в защищённой базе данных с ограниченным доступом, доступной только администрации Сервиса.",
+            "4.2. Данные доступа к игровым аккаунтам используются строго однократно для зачисления оплаченного товара и подлежат немедленному удалению сразу после завершения заказа. Сервис не сохраняет пароли и платёжные реквизиты банковских карт Пользователей.",
+            "4.3. Администрация принимает необходимые организационные и технические меры для предотвращения утечки, утраты, изменения или несанкционированного доступа к информации."
+        ]
+    ),
+    (
+        "5. Нераспространение и передача третьим лицам",
+        [
+            "5.1. Личные данные Пользователей строго конфиденциальны: они не продаются, не публикуются в открытом доступе и не распространяются среди третьих лиц.",
+            "5.2. Передача отдельных данных допускается исключительно в двух случаях: если это технически необходимо для проведения платежа или зачисления товара, либо по законному официальному требованию уполномоченных государственных органов."
+        ]
+    ),
+    (
+        "6. Права пользователя и удаление данных",
+        [
+            "6.1. Пользователь имеет право запросить информацию о своих данных, хранящихся в базе Сервиса, потребовать их исправления, отказаться от информационных рассылок или запросить полное удаление профиля и истории обращений.",
+            f"6.2. Для отзыва согласия, удаления данных или по любым вопросам конфиденциальности напишите нам в поддержку Telegram: {SUPPORT_USERNAME}."
+        ]
+    ),
+]
+
 
 # ================= АВТООЧИСТКА СТАРЫХ ПАПОК И БД =================
 def cleanup_old_files():
@@ -405,7 +509,7 @@ def cleanup_old_files():
         logging.info(f"Автоочистка выполнена. Удалено: {', '.join(removed_items)}")
 
 
-# ================= ГЕНЕРАТОР АТМОСФЕРНЫХ СЦЕН =================
+# ================= ГЕНЕРАТОР АТМОСФЕРНЫХ СЦЕН И PDF-ДОКУМЕНТОВ =================
 THEME_PALETTES = {
     "purple_forest": {
         "bg": (5, 7, 22),
@@ -541,26 +645,24 @@ def _file_md5(path: str) -> str:
     return h.hexdigest()
 
 
-def _download_fallback_font() -> str | None:
-    fallback_path = os.path.join("/tmp", "BombychFont-Bold.ttf")
-    if os.path.exists(fallback_path) and os.path.getsize(fallback_path) > 10000:
-        return fallback_path
-
-    urls = [
-        "https://github.com/google/fonts/raw/main/apache/roboto/static/Roboto-Bold.ttf",
-        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
-    ]
+def _download_font_file(urls: list[str], dest_path: str) -> str | None:
+    if os.path.exists(dest_path) and os.path.getsize(dest_path) > 10000:
+        try:
+            ImageFont.truetype(dest_path, 24)
+            return dest_path
+        except Exception:
+            pass
     for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = resp.read()
             if len(data) > 10000:
-                os.makedirs("/tmp", exist_ok=True)
-                with open(fallback_path, "wb") as f:
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                with open(dest_path, "wb") as f:
                     f.write(data)
-                ImageFont.truetype(fallback_path, 48)
-                return fallback_path
+                ImageFont.truetype(dest_path, 24)
+                return dest_path
         except Exception:
             continue
     return None
@@ -641,19 +743,81 @@ def _resolve_font_path() -> str | None:
         try:
             ImageFont.truetype(p, 48)
             _RESOLVED_FONT_PATH = p
-            logging.info(f"Найден шрифт Linux: {p}")
             return p
         except Exception:
             continue
 
-    downloaded = _download_fallback_font()
+    downloaded = _download_font_file(
+        [
+            "https://github.com/google/fonts/raw/main/apache/roboto/static/Roboto-Bold.ttf",
+            "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
+        ],
+        os.path.join("/tmp", "BombychFont-Bold.ttf")
+    )
     if downloaded:
         _RESOLVED_FONT_PATH = downloaded
-        logging.info(f"Загружен резервный шрифт: {downloaded}")
         return downloaded
 
-    logging.warning("TTF-шрифты не найдены, используется встроенный шрифт Pillow.")
     return None
+
+
+def _resolve_doc_fonts() -> tuple[str | None, str | None]:
+    """Ищет аккуратный читаемый шрифт (обычный + жирный) для PDF-документов (не Impact)."""
+    reg_candidates = [
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\calibri.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    ]
+    bold_candidates = [
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+        "C:\\Windows\\Fonts\\segoeuib.ttf",
+        "C:\\Windows\\Fonts\\calibrib.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    ]
+
+    reg_path = None
+    for p in reg_candidates:
+        if os.path.exists(p):
+            try:
+                ImageFont.truetype(p, 20)
+                reg_path = p
+                break
+            except Exception:
+                pass
+
+    bold_path = None
+    for p in bold_candidates:
+        if os.path.exists(p):
+            try:
+                ImageFont.truetype(p, 20)
+                bold_path = p
+                break
+            except Exception:
+                pass
+
+    if not reg_path:
+        reg_path = _download_font_file(
+            [
+                "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf",
+                "https://github.com/google/fonts/raw/main/apache/roboto/static/Roboto-Regular.ttf",
+            ],
+            os.path.join("/tmp", "BombychDoc-Regular.ttf")
+        )
+    if not bold_path:
+        bold_path = _download_font_file(
+            [
+                "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
+                "https://github.com/google/fonts/raw/main/apache/roboto/static/Roboto-Bold.ttf",
+            ],
+            os.path.join("/tmp", "BombychDoc-Bold.ttf")
+        ) or reg_path
+
+    return reg_path, bold_path
 
 
 def _load_bold_font(size: int):
@@ -670,7 +834,6 @@ def _load_bold_font(size: int):
 
 
 def _fit_font(draw: ImageDraw.ImageDraw, text: str, max_w: int, start_size: int, min_size: int = 34):
-    """Автоматически подбирает размер шрифта, чтобы текст всегда помещался на баннер с отступами."""
     sz = start_size
     while sz >= min_size:
         f = _load_bold_font(sz)
@@ -680,6 +843,195 @@ def _fit_font(draw: ImageDraw.ImageDraw, text: str, max_w: int, start_size: int,
         sz -= 4
     f = _load_bold_font(min_size)
     return f, draw.textbbox((0, 0), text, font=f)
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_w: int) -> list[str]:
+    words = text.split(" ")
+    lines: list[str] = []
+    cur = ""
+    for word in words:
+        cand = f"{cur} {word}".strip() if cur else word
+        if draw.textlength(cand, font=font) <= max_w:
+            cur = cand
+        else:
+            if cur:
+                lines.append(cur)
+                cur = word
+            else:
+                # Разбиение слишком длинного слова
+                chunk = ""
+                for ch in word:
+                    if draw.textlength(chunk + ch, font=font) <= max_w:
+                        chunk += ch
+                    else:
+                        if chunk:
+                            lines.append(chunk)
+                        chunk = ch
+                cur = chunk
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _generate_legal_pdf(
+    pdf_path: str,
+    title: str,
+    subtitle: str,
+    sections: list[tuple[str, list[str]]],
+    reg_font_path: str,
+    bold_font_path: str
+):
+    """Создаёт аккуратный многостраничный PDF-документ формата A4 средствами Pillow."""
+    W, H = 1000, 1414
+    ML, MR, MT, MB = 68, 68, 64, 88
+    CONTENT_W = W - ML - MR
+
+    f_brand = ImageFont.truetype(bold_font_path, 20)
+    f_sub = ImageFont.truetype(reg_font_path, 17)
+    f_sec = ImageFont.truetype(bold_font_path, 22)
+    f_body = ImageFont.truetype(reg_font_path, 19)
+    f_foot = ImageFont.truetype(reg_font_path, 15)
+
+    # Автоподбор размера заголовка документа
+    t_sz = 32
+    f_title = ImageFont.truetype(bold_font_path, t_sz)
+    tmp_dr = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    while t_sz > 22 and tmp_dr.textlength(title, font=f_title) > CONTENT_W:
+        t_sz -= 2
+        f_title = ImageFont.truetype(bold_font_path, t_sz)
+
+    pages: list[Image.Image] = []
+
+    def new_page(first: bool = False):
+        pg = Image.new("RGB", (W, H), (255, 255, 255))
+        dr = ImageDraw.Draw(pg)
+        if first:
+            dr.rectangle([0, 0, W, 166], fill=(18, 10, 38))
+            dr.rectangle([0, 166, W, 173], fill=(138, 43, 226))
+            dr.text((ML, 30), "BOMBYCH STORE  •  ОФИЦИАЛЬНЫЙ ДОКУМЕНТ", font=f_brand, fill=(195, 160, 255))
+            dr.text((ML, 68), title, font=f_title, fill=(255, 255, 255))
+            dr.text((ML, 120), subtitle, font=f_sub, fill=(188, 195, 220))
+            return pg, dr, 212
+        else:
+            dr.rectangle([0, 0, W, 8], fill=(138, 43, 226))
+            return pg, dr, MT
+
+    page, draw, y = new_page(first=True)
+    pages.append(page)
+
+    line_h = 28
+    for sec_title, paragraphs in sections:
+        if y + 84 > H - MB:
+            page, draw, y = new_page(first=False)
+            pages.append(page)
+
+        draw.text((ML, y), sec_title, font=f_sec, fill=(72, 24, 148))
+        y += 32
+        draw.line([(ML, y), (W - MR, y)], fill=(230, 222, 248), width=2)
+        y += 14
+
+        for para in paragraphs:
+            is_bullet = para.startswith("•")
+            indent = 16 if is_bullet else 0
+            wrapped = _wrap_text(draw, para, f_body, CONTENT_W - indent)
+            for ln in wrapped:
+                if y + line_h > H - MB:
+                    page, draw, y = new_page(first=False)
+                    pages.append(page)
+                draw.text((ML + indent, y), ln, font=f_body, fill=(32, 34, 44))
+                y += line_h
+            y += 10
+        y += 14
+
+    total_pages = len(pages)
+    for idx, pg in enumerate(pages, start=1):
+        dr = ImageDraw.Draw(pg)
+        dr.line([(ML, H - 64), (W - MR, H - 64)], fill=(228, 226, 238), width=1)
+        dr.text((ML, H - 48), f"Bombych Store  •  Поддержка: {SUPPORT_USERNAME}", font=f_foot, fill=(125, 128, 145))
+        pg_label = f"Стр. {idx} из {total_pages}"
+        lbl_w = dr.textlength(pg_label, font=f_foot)
+        dr.text((W - MR - lbl_w, H - 48), pg_label, font=f_foot, fill=(125, 128, 145))
+
+    if total_pages == 1:
+        pages[0].save(pdf_path, "PDF", resolution=120.0)
+    else:
+        pages[0].save(pdf_path, "PDF", resolution=120.0, save_all=True, append_images=pages[1:])
+
+
+def _generate_legal_txt(txt_path: str, title: str, subtitle: str, sections: list[tuple[str, list[str]]]):
+    lines = [
+        "============================================================",
+        f"BOMBYCH STORE — {title.upper()}",
+        subtitle,
+        "============================================================",
+        "",
+    ]
+    for sec_title, paragraphs in sections:
+        lines.append(sec_title)
+        lines.append("------------------------------------------------------------")
+        for p in paragraphs:
+            lines.append(p)
+            lines.append("")
+        lines.append("")
+    lines.append("============================================================")
+    lines.append(f"Поддержка Bombych Store: {SUPPORT_USERNAME}")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def prepare_legal_documents():
+    """Генерирует аккуратные файлы Соглашения и Политики (PDF, при отсутствии шрифтов — TXT)."""
+    os.makedirs(IMG_DIR, exist_ok=True)
+    reg_font, bold_font = _resolve_doc_fonts()
+    use_pdf = bool(reg_font and bold_font)
+
+    docs_spec = [
+        (
+            "terms",
+            "Пользовательское соглашение",
+            "Правила использования сервиса Bombych Store • Актуальная редакция",
+            TERMS_SECTIONS,
+            "terms_doc",
+            "Пользовательское_соглашение_BombychStore",
+        ),
+        (
+            "privacy",
+            "Политика конфиденциальности",
+            "Порядок обработки и защиты данных Bombych Store • Актуальная редакция",
+            PRIVACY_SECTIONS,
+            "privacy_doc",
+            "Политика_конфиденциальности_BombychStore",
+        ),
+    ]
+
+    DOC_META.clear()
+    for key, title, subtitle, sections, disk_base, send_base in docs_spec:
+        ext = ".pdf" if use_pdf else ".txt"
+        disk_name = f"{disk_base}{ext}"
+        disk_path = os.path.join(IMG_DIR, disk_name)
+        send_name = f"{send_base}{ext}"
+
+        if use_pdf:
+            try:
+                _generate_legal_pdf(disk_path, title, subtitle, sections, reg_font, bold_font)
+            except Exception as e:
+                logging.warning(f"Не удалось собрать PDF {key}, переход на TXT: {e}")
+                ext = ".txt"
+                disk_name = f"{disk_base}{ext}"
+                disk_path = os.path.join(IMG_DIR, disk_name)
+                send_name = f"{send_base}{ext}"
+                _generate_legal_txt(disk_path, title, subtitle, sections)
+        else:
+            _generate_legal_txt(disk_path, title, subtitle, sections)
+
+        cache_key = f"doc:{key}"
+        DOC_META[key] = {
+            "disk_path": disk_path,
+            "disk_name": disk_name,
+            "send_name": send_name,
+            "cache_key": cache_key,
+        }
+        FILE_HASHES[cache_key] = _file_md5(disk_path)
 
 
 def _make_fallback_logo() -> Image.Image:
@@ -997,6 +1349,8 @@ def prepare_all_banners():
         if fname.endswith((".jpg", ".png")):
             FILE_HASHES[fname] = _file_md5(os.path.join(IMG_DIR, fname))
 
+    prepare_legal_documents()
+
 
 # ================= БАЗА ДАННЫХ И RAM-КЭШИРОВАНИЕ =================
 async def init_db_and_cache():
@@ -1018,7 +1372,6 @@ async def init_db_and_cache():
                 accepted_terms INTEGER DEFAULT 0
             )
         """)
-        # Безопасная миграция для существующей базы данных
         async with DB_CONN.execute("PRAGMA table_info(users)") as cur:
             user_cols = {row[1] for row in await cur.fetchall()}
         if "accepted_terms" not in user_cols:
@@ -1117,10 +1470,14 @@ async def init_db_and_cache():
         await DB_CONN.commit()
 
         PHOTO_CACHE.clear()
+        DOC_CACHE.clear()
         async with DB_CONN.execute("SELECT image_name, file_id, file_hash FROM media_cache_v2") as cur:
-            for img_name, fid, fhash in await cur.fetchall():
-                if FILE_HASHES.get(img_name) == fhash:
-                    PHOTO_CACHE[img_name] = fid
+            for item_key, fid, fhash in await cur.fetchall():
+                if FILE_HASHES.get(item_key) == fhash:
+                    if item_key.startswith("doc:"):
+                        DOC_CACHE[item_key] = fid
+                    else:
+                        PHOTO_CACHE[item_key] = fid
 
         KNOWN_USERS.clear()
         ACCEPTED_USERS.clear()
@@ -1213,17 +1570,17 @@ async def reload_catalog_cache():
         )
 
 
-async def _save_file_id_bg(image_name: str, file_id: str):
+async def _save_file_id_bg(cache_key: str, file_id: str):
     try:
-        fhash = FILE_HASHES.get(image_name, "")
+        fhash = FILE_HASHES.get(cache_key, "")
         async with DB_LOCK:
             await DB_CONN.execute(
                 "INSERT OR REPLACE INTO media_cache_v2 (image_name, file_id, file_hash) VALUES (?, ?, ?)",
-                (image_name, file_id, fhash)
+                (cache_key, file_id, fhash)
             )
             await DB_CONN.commit()
     except Exception as e:
-        logging.debug(f"Не удалось сохранить file_id для {image_name}: {e}")
+        logging.debug(f"Не удалось сохранить file_id для {cache_key}: {e}")
 
 
 def _clean_username(uname: str | None) -> str:
@@ -1265,11 +1622,26 @@ async def register_user(user, force_update: bool = False):
 
 
 async def set_user_accepted(user, accepted: bool):
-    await register_user(user, force_update=True)
+    uname = user.username or ""
+    fname = user.first_name or "Гость"
     val = 1 if accepted else 0
+    now_date = datetime.now().strftime("%d.%m.%Y")
+
     async with DB_LOCK:
-        await DB_CONN.execute("UPDATE users SET accepted_terms = ? WHERE user_id = ?", (val, user.id))
+        await DB_CONN.execute(
+            """
+            INSERT INTO users (user_id, username, first_name, joined_at, accepted_terms)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                accepted_terms = excluded.accepted_terms
+            """,
+            (user.id, uname, fname, now_date, val)
+        )
         await DB_CONN.commit()
+
+    KNOWN_USERS.add(user.id)
     if accepted:
         ACCEPTED_USERS.add(user.id)
     else:
@@ -1293,11 +1665,11 @@ def _get_user_lock(user_id: int) -> asyncio.Lock:
     return lock
 
 
-def _remember_screen(chat_id: int, message_id: int, image_name: str):
+def _remember_screen(chat_id: int, message_id: int, screen_tag: str):
     if len(LAST_SCREEN_IMG) > 5000:
         for k in list(LAST_SCREEN_IMG.keys())[:2500]:
             LAST_SCREEN_IMG.pop(k, None)
-    LAST_SCREEN_IMG[(chat_id, message_id)] = image_name
+    LAST_SCREEN_IMG[(chat_id, message_id)] = screen_tag
 
 
 async def _cleanup_aux_msgs(bot: Bot, chat_id: int, user_id: int):
@@ -1347,26 +1719,86 @@ async def _send_fresh_photo(
     return sent
 
 
-async def _send_banner_and_long_text(
+async def _send_fresh_doc(
     msg_target: Message,
-    user_id: int,
-    image_name: str,
-    full_text: str,
+    doc_key: str,
+    doc_caption: str,
     kb: InlineKeyboardMarkup | None
 ):
-    """Для экранов длиннее 1000 символов: отправляет баннер + полный текст без риска ошибки caption_too_long."""
-    banner_title = full_text.split("\n", 1)[0][:200]
-    try:
-        banner_msg = await _send_fresh_photo(msg_target, image_name, banner_title, None)
-        _add_aux_msg(msg_target.chat.id, user_id, banner_msg.message_id)
-    except Exception as e:
-        logging.warning(f"Не удалось отправить баннер {image_name}: {e}")
+    meta = DOC_META[doc_key]
+    cache_key = meta["cache_key"]
+    cached_fid = DOC_CACHE.get(cache_key)
+    doc_media = cached_fid or FSInputFile(meta["disk_path"], filename=meta["send_name"])
 
-    safe_text = full_text if _plain_len(full_text) <= 4050 else full_text[:4000] + "..."
-    await asyncio.wait_for(
-        msg_target.answer(safe_text, reply_markup=kb, disable_web_page_preview=True),
-        timeout=12.0
+    sent = await asyncio.wait_for(
+        msg_target.answer_document(document=doc_media, caption=doc_caption, reply_markup=kb),
+        timeout=15.0
     )
+    _remember_screen(sent.chat.id, sent.message_id, f"{cache_key}")
+    if not cached_fid and sent.document:
+        fid = sent.document.file_id
+        DOC_CACHE[cache_key] = fid
+        asyncio.create_task(_save_file_id_bg(cache_key, fid))
+    return sent
+
+
+async def show_doc_screen(
+    target: Message | CallbackQuery,
+    image_name: str,
+    photo_caption: str,
+    doc_key: str,
+    doc_caption: str,
+    kb: InlineKeyboardMarkup,
+    screen_tag: str
+):
+    """Показывает баннер с краткой подписью и аккуратный файл документа сразу под ним."""
+    if isinstance(target, CallbackQuery):
+        asyncio.create_task(_quick_answer(target))
+        uid = target.from_user.id
+        lock = _get_user_lock(uid)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=4.0)
+        except asyncio.TimeoutError:
+            return
+        try:
+            msg = target.message
+            if not msg:
+                return
+            chat_id, msg_id = msg.chat.id, msg.message_id
+
+            # Защита от лишней перерисовки при повторном нажатии той же вкладки
+            if LAST_SCREEN_IMG.get((chat_id, msg_id)) == screen_tag:
+                return
+
+            await _cleanup_aux_msgs(target.bot, chat_id, uid)
+            LAST_SCREEN_IMG.pop((chat_id, msg_id), None)
+            try:
+                await asyncio.wait_for(msg.delete(), timeout=4.0)
+            except Exception:
+                pass
+
+            banner_msg = await _send_fresh_photo(msg, image_name, photo_caption, None)
+            _add_aux_msg(chat_id, uid, banner_msg.message_id)
+
+            doc_msg = await _send_fresh_doc(msg, doc_key, doc_caption, kb)
+            _remember_screen(doc_msg.chat.id, doc_msg.message_id, screen_tag)
+        finally:
+            lock.release()
+    else:
+        uid = target.from_user.id
+        lock = _get_user_lock(uid)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=4.0)
+        except asyncio.TimeoutError:
+            return
+        try:
+            banner_msg = await _send_fresh_photo(target, image_name, photo_caption, None)
+            _add_aux_msg(target.chat.id, uid, banner_msg.message_id)
+
+            doc_msg = await _send_fresh_doc(target, doc_key, doc_caption, kb)
+            _remember_screen(doc_msg.chat.id, doc_msg.message_id, screen_tag)
+        finally:
+            lock.release()
 
 
 async def show_screen(
@@ -1376,8 +1808,6 @@ async def show_screen(
     kb: InlineKeyboardMarkup,
     answer_cb: bool = True
 ):
-    is_long = _plain_len(caption) > 1000
-
     if isinstance(target, CallbackQuery):
         if answer_cb:
             asyncio.create_task(_quick_answer(target))
@@ -1395,20 +1825,9 @@ async def show_screen(
 
             await _cleanup_aux_msgs(target.bot, chat_id, uid)
 
-            # Длинный экран (например, полная Политика или Соглашение)
-            if is_long:
-                LAST_SCREEN_IMG.pop((chat_id, msg_id), None)
-                try:
-                    await asyncio.wait_for(msg.delete(), timeout=4.0)
-                except Exception:
-                    pass
-                await _send_banner_and_long_text(msg, uid, image_name, caption, kb)
-                return
-
             has_photo = bool(msg.photo)
             same_image = (LAST_SCREEN_IMG.get((chat_id, msg_id)) == image_name) and has_photo
 
-            # Быстрый путь: картинка та же -> обновляем только подпись и кнопки
             if same_image:
                 try:
                     await asyncio.wait_for(msg.edit_caption(caption=caption, reply_markup=kb), timeout=12.0)
@@ -1426,7 +1845,6 @@ async def show_screen(
                 except Exception:
                     pass
 
-            # Обычный путь: сообщение с фото -> меняем медиа
             if has_photo:
                 cached_fid = PHOTO_CACHE.get(image_name)
                 media_file = cached_fid or FSInputFile(os.path.join(IMG_DIR, image_name))
@@ -1452,7 +1870,6 @@ async def show_screen(
                 except Exception:
                     pass
 
-            # Резервный путь (или переход с текстового экрана на фото-экран)
             LAST_SCREEN_IMG.pop((chat_id, msg_id), None)
             try:
                 await asyncio.wait_for(msg.delete(), timeout=4.0)
@@ -1472,11 +1889,8 @@ async def show_screen(
         except asyncio.TimeoutError:
             return
         try:
-            await _cleanup_aux_msgs(target.bot, target.chat.id, uid)
-            if is_long:
-                await _send_banner_and_long_text(target, uid, image_name, caption, kb)
-            else:
-                await _send_fresh_photo(target, image_name, caption, kb)
+            AUX_MSGS.pop((target.chat.id, uid), None)
+            await _send_fresh_photo(target, image_name, caption, kb)
         finally:
             lock.release()
 
@@ -1569,18 +1983,10 @@ HOME_KB_USER = inline_home_kb(0)
 HOME_KB_ADMIN = inline_home_kb(ADMIN_ID)
 
 GATE_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [
-        InlineKeyboardButton(text="📄 Пользовательское соглашение", callback_data="gate_terms"),
-    ],
-    [
-        InlineKeyboardButton(text="🔒 Политика конфиденциальности", callback_data="gate_privacy"),
-    ],
-    [
-        InlineKeyboardButton(text="✅ Принимаю условия", callback_data="legal_accept"),
-    ],
-    [
-        InlineKeyboardButton(text="❌ Отказаться и выйти", callback_data="legal_decline"),
-    ],
+    [InlineKeyboardButton(text="📄 Пользовательское соглашение", callback_data="gate_terms")],
+    [InlineKeyboardButton(text="🔒 Политика конфиденциальности", callback_data="gate_privacy")],
+    [InlineKeyboardButton(text="✅ Принимаю условия", callback_data="legal_accept")],
+    [InlineKeyboardButton(text="❌ Отказаться и выйти", callback_data="legal_decline")],
 ])
 
 GATE_DOC_KB = InlineKeyboardMarkup(inline_keyboard=[
@@ -1592,9 +1998,7 @@ GATE_DOC_KB = InlineKeyboardMarkup(inline_keyboard=[
         InlineKeyboardButton(text="✅ Принимаю условия", callback_data="legal_accept"),
         InlineKeyboardButton(text="❌ Отказаться", callback_data="legal_decline"),
     ],
-    [
-        InlineKeyboardButton(text="⬅️ Назад", callback_data="gate_back"),
-    ],
+    [InlineKeyboardButton(text="⬅️ Назад", callback_data="gate_back")],
 ])
 
 INFO_KB = InlineKeyboardMarkup(inline_keyboard=[
@@ -1647,18 +2051,35 @@ BACK_XBOX_KB = InlineKeyboardMarkup(inline_keyboard=[
 ])
 
 
-# ================= ТЕКСТЫ ВИТРИНЫ И ЮРИДИЧЕСКИЕ ДОКУМЕНТЫ =================
+# ================= ТЕКСТЫ ВИТРИНЫ И ПОДПИСИ ДОКУМЕНТОВ =================
 SAFE_SUPPORT_USER = html.escape(SUPPORT_USERNAME)
 
 GATE_TEXT = (
     "🛡 <b>Добро пожаловать в Bombych Store!</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "Перед началом работы с магазином необходимо ознакомиться и согласиться с нашими документами:\n\n"
+    "Перед первым входом необходимо ознакомиться и принять наши официальные документы:\n\n"
     "<blockquote>📄 <b>Пользовательское соглашение</b> — правила оформления, оплаты, выдачи и возврата заказов.\n"
-    "🔒 <b>Политика конфиденциальности</b> — порядок сбора, хранения, защиты и нераспространения ваших данных.</blockquote>\n"
-    "Нажимая <b>«✅ Принимаю условия»</b>, вы подтверждаете согласие с обоими документами.\n"
-    "При отказе использование бота будет прекращено."
+    "🔒 <b>Политика конфиденциальности</b> — порядок сбора, защиты и нераспространения ваших личных данных.</blockquote>\n"
+    "Нажмите <b>«✅ Принимаю условия»</b> для входа в магазин (повторно подтверждать не потребуется)."
 )
+
+TERMS_PHOTO_CAPTION = (
+    "📄 <b>Пользовательское соглашение • Bombych Store</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "<blockquote>В документе подробно описаны правила работы магазина, порядок оплаты и выдачи заказов (05:00–22:00 МСК), "
+    "условия возврата цифровых товаров и ответственность сторон.</blockquote>\n"
+    "👇 <b>Полный документ прикреплён файлом ниже.</b>"
+)
+
+PRIVACY_PHOTO_CAPTION = (
+    "🔒 <b>Политика конфиденциальности • Bombych Store</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "<blockquote>В документе указано, какие данные собирает бот, как они защищаются, "
+    "почему не передаются третьим лицам и как запросить их удаление.</blockquote>\n"
+    "👇 <b>Полный документ прикреплён файлом ниже.</b>"
+)
+
+DOC_FILE_CAPTION = "📎 <b>Откройте файл, чтобы прочитать полный текст документа.</b>"
 
 HOME_TEXT = (
     "💜 <b>Bombych Store • Магазин игрового доната</b>\n"
@@ -1713,56 +2134,6 @@ RULES_TEXT = (
     "и гарантируем полную выдачу оплаченного товара.</blockquote>"
 )
 
-TERMS_TEXT = (
-    "📄 <b>Пользовательское соглашение • Bombych Store</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "<b>1. Общие положения</b>\n"
-    "1.1. Настоящее Соглашение регулирует порядок использования Telegram-бота Bombych Store (далее — Сервис).\n"
-    "1.2. Нажимая кнопку согласия и используя Сервис, Пользователь подтверждает полное принятие условий и достижение возраста 18 лет (либо наличие согласия законных представителей).\n\n"
-    "<b>2. Предмет соглашения</b>\n"
-    "2.1. Сервис оказывает услуги по приобретению и зачислению цифровых товаров, игровой валюты, кодов активации и подписок.\n"
-    "2.2. Сервис является независимой площадкой и не аффилирован с Epic Games, Supercell, Valve, Telegram, Discord, Roblox, miHoYo и иными правообладателями.\n\n"
-    "<b>3. Оформление и оплата заказов</b>\n"
-    "3.1. Актуальные цены указаны в каталоге Сервиса. Оплата производится по реквизитам, выданным при оформлении заказа.\n"
-    "3.2. Заказ поступает в обработку после предоставления действительного чека об оплате и его проверки администратором.\n\n"
-    "<b>4. Сроки выдачи и условия возврата</b>\n"
-    "4.1. Приём заявок ведётся 24/7, выдача выполняется в рабочие часы: <code>05:00 – 22:00 (МСК)</code>.\n"
-    "4.2. Цифровые товары, коды и внутриигровые зачисления надлежащего качества после передачи/активации возврату и обмену не подлежат.\n"
-    "4.3. Если заказ невозможно выполнить по вине Сервиса, Пользователю осуществляется полный возврат оплаченной суммы.\n\n"
-    "<b>5. Права, обязанности и ограничения</b>\n"
-    "5.1. Пользователь несёт полную ответственность за корректность переданных данных (ID, UID, @username, регион, привязка Xbox/Supercell ID).\n"
-    "5.2. Запрещена отправка поддельных чеков, спам, оскорбления администрации и попытки обхода работы Сервиса. При нарушении доступ блокируется.\n"
-    "5.3. Сервис не отвечает за временные сбои платёжных шлюзов, Telegram или игровых серверов, а также за ограничения, наложенные правообладателями игр.\n\n"
-    "<b>6. Заключительные положения</b>\n"
-    f"6.1. Администрация вправе обновлять Соглашение без предварительного уведомления. По всем вопросам обращайтесь к нам в поддержку: {SAFE_SUPPORT_USER}."
-)
-
-PRIVACY_TEXT = (
-    "🔒 <b>Политика конфиденциальности • Bombych Store</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━\n"
-    "<b>1. Общие положения</b>\n"
-    "1.1. Настоящая Политика определяет порядок сбора, хранения, обработки и защиты персональных данных пользователей бота Bombych Store (в соответствии с базовыми принципами ФЗ № 152-ФЗ «О персональных данных»).\n"
-    "1.2. Использование Сервиса означает безоговорочное согласие Пользователя с данной Политикой.\n\n"
-    "<b>2. Какие данные мы собираем</b>\n"
-    "• <b>Данные Telegram:</b> уникальный ID, @username, отображаемое имя, дата регистрации в боте.\n"
-    "• <b>Данные заказов:</b> выбранные позиции, суммы, способы оплаты, статусы, скриншоты/файлы чеков и комментарии к заказам.\n"
-    "• <b>Данные для зачисления:</b> игровой ID, UID, тег, почта или временные реквизиты доступа, переданные самим Пользователем для выполнения конкретного заказа.\n\n"
-    "<b>3. Цели обработки персональных данных</b>\n"
-    "• Идентификация Пользователя и ведение личного кабинета и истории покупок.\n"
-    "• Проверка оплаты, выполнение заказов и оказание технической поддержки.\n"
-    "• Информирование о статусах заказов, акциях и важных обновлениях Сервиса.\n\n"
-    "<b>4. Хранение и защита информации</b>\n"
-    "4.1. Технические данные и история заказов хранятся в защищённой базе данных с ограниченным доступом.\n"
-    "4.2. Данные игровых аккаунтов используются <b>строго однократно</b> для зачисления товара и безвозвратно удаляются сразу после выполнения заказа.\n"
-    "4.3. Администрация принимает необходимые организационные и технические меры для защиты данных от утечки, утраты и несанкционированного доступа.\n\n"
-    "<b>5. Распространение и передача третьим лицам</b>\n"
-    "5.1. Личные данные Пользователей <b>не продаются, не публикуются и не распространяются</b> среди третьих лиц.\n"
-    "5.2. Передача сведений возможна исключительно в двух случаях: если это технически необходимо для проведения платежа/доставки товара, либо по законному официальному запросу уполномоченных государственных органов.\n\n"
-    "<b>6. Права пользователя и удаление данных</b>\n"
-    "6.1. Пользователь вправе запросить сведения о своих хранящихся данных, потребовать их исправления, отказаться от рассылок или запросить полное удаление профиля из базы.\n"
-    f"6.2. Для реализации этих прав и по любым вопросам конфиденциальности напишите нам в поддержку: {SAFE_SUPPORT_USER}."
-)
-
 SUPPORT_TEXT = (
     "🆘 <b>Поддержка • Bombych Store</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
@@ -1786,17 +2157,18 @@ XBOX_TEXT = (
 )
 
 
-# ================= ЗАЩИТА ПЕРВОГО ВХОДА (СОГЛАСИЕ С УСЛОВИЯМИ) =================
+# ================= ЗАЩИТА ПЕРВОГО ВХОДА (ОДНОКРАТНОЕ СОГЛАСИЕ) =================
 async def send_consent_gate(message: Message):
+    uid = message.from_user.id
     try:
         rm_msg = await asyncio.wait_for(
             message.answer("👋 <b>Добро пожаловать в Bombych Store!</b>", reply_markup=ReplyKeyboardRemove()),
             timeout=10.0
         )
-        _add_aux_msg(message.chat.id, message.from_user.id, rm_msg.message_id)
+        _add_aux_msg(message.chat.id, uid, rm_msg.message_id)
     except Exception:
         pass
-    await show_screen(message, "main.jpg", GATE_TEXT, GATE_KB)
+    await _send_fresh_photo(message, "main.jpg", GATE_TEXT, GATE_KB)
 
 
 class TermsGateMiddleware(BaseMiddleware):
@@ -1838,12 +2210,18 @@ router.callback_query.middleware(TermsGateMiddleware())
 
 @router.callback_query(F.data == "gate_terms")
 async def cb_gate_terms(call: CallbackQuery):
-    await show_screen(call, "terms.jpg", TERMS_TEXT, GATE_DOC_KB)
+    await show_doc_screen(
+        call, "terms.jpg", TERMS_PHOTO_CAPTION,
+        "terms", DOC_FILE_CAPTION, GATE_DOC_KB, "gate_doc:terms"
+    )
 
 
 @router.callback_query(F.data == "gate_privacy")
 async def cb_gate_privacy(call: CallbackQuery):
-    await show_screen(call, "privacy.jpg", PRIVACY_TEXT, GATE_DOC_KB)
+    await show_doc_screen(
+        call, "privacy.jpg", PRIVACY_PHOTO_CAPTION,
+        "privacy", DOC_FILE_CAPTION, GATE_DOC_KB, "gate_doc:privacy"
+    )
 
 
 @router.callback_query(F.data == "gate_back")
@@ -1927,7 +2305,7 @@ async def cb_legal_decline(call: CallbackQuery, state: FSMContext):
 
 @router.message(Command("reset_terms"))
 async def cmd_reset_terms(message: Message, state: FSMContext):
-    """Служебная команда только для админа, чтобы повторно проверить окно согласия."""
+    """Служебная команда только для админа, чтобы повторно проверить экран первого входа."""
     if message.from_user.id != ADMIN_ID:
         return
     if await state.get_state():
@@ -1943,6 +2321,7 @@ async def cmd_start(message: Message, state: FSMContext):
         await state.clear()
     await register_user(message.from_user, force_update=True)
 
+    # Показываем окно согласия ТОЛЬКО если пользователь ещё ни разу не принимал условия
     if message.from_user.id not in ACCEPTED_USERS:
         await send_consent_gate(message)
         return
@@ -2022,28 +2401,40 @@ async def cb_rules(call: CallbackQuery, state: FSMContext):
 async def msg_terms(message: Message, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await show_screen(message, "terms.jpg", TERMS_TEXT, LEGAL_KB)
+    await show_doc_screen(
+        message, "terms.jpg", TERMS_PHOTO_CAPTION,
+        "terms", DOC_FILE_CAPTION, LEGAL_KB, "nav_doc:terms"
+    )
 
 
 @router.callback_query(F.data == "nav_terms")
 async def cb_terms(call: CallbackQuery, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await show_screen(call, "terms.jpg", TERMS_TEXT, LEGAL_KB)
+    await show_doc_screen(
+        call, "terms.jpg", TERMS_PHOTO_CAPTION,
+        "terms", DOC_FILE_CAPTION, LEGAL_KB, "nav_doc:terms"
+    )
 
 
 @router.message(Command("privacy"))
 async def msg_privacy(message: Message, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await show_screen(message, "privacy.jpg", PRIVACY_TEXT, LEGAL_KB)
+    await show_doc_screen(
+        message, "privacy.jpg", PRIVACY_PHOTO_CAPTION,
+        "privacy", DOC_FILE_CAPTION, LEGAL_KB, "nav_doc:privacy"
+    )
 
 
 @router.callback_query(F.data == "nav_privacy")
 async def cb_privacy(call: CallbackQuery, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await show_screen(call, "privacy.jpg", PRIVACY_TEXT, LEGAL_KB)
+    await show_doc_screen(
+        call, "privacy.jpg", PRIVACY_PHOTO_CAPTION,
+        "privacy", DOC_FILE_CAPTION, LEGAL_KB, "nav_doc:privacy"
+    )
 
 
 @router.message(Command("xbox"))
@@ -2826,7 +3217,6 @@ async def main():
     prepare_all_banners()
     await init_db_and_cache()
 
-    # Таймаут сессии строго больше polling_timeout, чтобы long-polling никогда не обрывался по таймауту
     session = AiohttpSession(timeout=60)
     bot = Bot(token=BOT_TOKEN, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await setup_menu_commands(bot)
@@ -2834,7 +3224,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Bombych Store v14 успешно запущен!")
+    logging.info("Bombych Store v15 успешно запущен!")
     try:
         await dp.start_polling(
             bot,
