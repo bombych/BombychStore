@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -39,7 +40,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # Токен автоматически берётся из вкладки «Переменные» / «Токен» на хостинге
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or ""
 ADMIN_ID = 5157852376
-SUPPORT_LINK = "https://t.me/bombystore_bot"  # Замени на свой @username поддержки
+
+# ТВОЙ ЛИЧНЫЙ КОНТАКТ В TELEGRAM (укажи свой актуальный @username)
+SUPPORT_USERNAME = "@bombych"
+SUPPORT_LINK = f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}"
 DONATIONALERTS_URL = "https://www.donationalerts.com/r/bombychyt"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,10 +52,11 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 CURRENT_DB_NAME = "bombystore_v10.db"
 DB_PATH = os.path.join(DATA_DIR, CURRENT_DB_NAME)
-IMG_DIR = os.path.join(BASE_DIR, "assets_v12")
+IMG_DIR = os.path.join(BASE_DIR, "assets_v13")
 CATALOG_SCHEMA_VERSION = "v12_fortnite_folder"
 
 FORTNITE_CAT_IDS = (1, 2, 3)
+USERS_PER_PAGE = 8
 
 PAYMENT_DA_TEXT = (
     "🧡 <b>Оплата через DonationAlerts:</b>\n"
@@ -362,6 +367,9 @@ SERVICE_BANNERS = [
     ("info.jpg", "purple_forest", ("INFORMATION", "")),
     ("rules.jpg", "purple_forest", ("ПРАВИЛА", "")),
     ("xbox.jpg", "cyan_night", ("ПРИВЯЗКА", "")),
+    ("support.jpg", "blue_royal", ("ПОДДЕРЖКА", "")),
+    ("terms.jpg", "violet_neon", ("СОГЛАШЕНИЕ", "")),
+    ("privacy.jpg", "cyan_night", ("ПОЛИТИКА", "ДАННЫХ")),
 ]
 
 
@@ -795,7 +803,7 @@ def _render_chisel_3d_text(canvas: Image.Image, line1: str, line2: str, pal: dic
         mdraw.text((x1, y1), line1, font=f1, fill=255)
         mdraw.text((x2, y2), line2, font=f2, fill=255)
     else:
-        f1 = _load_bold_font(146 if len(line1) <= 7 else (120 if len(line1) <= 10 else 94))
+        f1 = _load_bold_font(146 if len(line1) <= 7 else (112 if len(line1) <= 10 else 86))
         b1 = mdraw.textbbox((0, 0), line1, font=f1)
         w1, h1 = b1[2] - b1[0], b1[3] - b1[1]
         mdraw.text(((w - w1) // 2 - b1[0], (h - h1) // 2 - b1[1] - 4), line1, font=f1, fill=255)
@@ -914,6 +922,11 @@ def _compute_assets_stamp() -> str:
     return h.hexdigest()
 
 
+def target_not_uploaded(img_name: str) -> bool:
+    cands = USER_UPLOADED_MAP.get(img_name, [])
+    return _find_user_file(cands) is None if cands else True
+
+
 def prepare_all_banners():
     cleanup_old_files()
     os.makedirs(IMG_DIR, exist_ok=True)
@@ -962,16 +975,10 @@ def prepare_all_banners():
         with open(stamp_file, "w", encoding="utf-8") as f:
             f.write(current_stamp)
 
-    # Кэшируем MD5 всех итоговых файлов для мгновенной валидации Telegram file_id
     FILE_HASHES.clear()
     for fname in os.listdir(IMG_DIR):
         if fname.endswith((".jpg", ".png")):
             FILE_HASHES[fname] = _file_md5(os.path.join(IMG_DIR, fname))
-
-
-def target_not_uploaded(img_name: str) -> bool:
-    cands = USER_UPLOADED_MAP.get(img_name, [])
-    return _find_user_file(cands) is None if cands else True
 
 
 # ================= БАЗА ДАННЫХ И RAM-КЭШИРОВАНИЕ =================
@@ -1054,7 +1061,6 @@ async def init_db_and_cache():
                         (cid, fname, btn_lbl, old_p, new_p, cimg)
                     )
         else:
-            # Мягкое обновление названий/описаний категорий без потери заказов и товаров
             async with DB_CONN.execute("SELECT value FROM settings WHERE key = 'catalog_ver'") as cur:
                 row = await cur.fetchone()
                 cur_ver = row[0] if row else None
@@ -1086,7 +1092,6 @@ async def init_db_and_cache():
         )
         await DB_CONN.commit()
 
-    # Подгружаем актуальный кэш file_id из БД (только если хэш картинки не изменился)
     PHOTO_CACHE.clear()
     async with DB_CONN.execute("SELECT image_name, file_id, file_hash FROM media_cache_v2") as cur:
         for img_name, fid, fhash in await cur.fetchall():
@@ -1194,19 +1199,41 @@ async def _save_file_id_bg(image_name: str, file_id: str):
         logging.debug(f"Не удалось сохранить file_id для {image_name}: {e}")
 
 
-async def register_user(user):
-    if user.id in KNOWN_USERS:
+def _clean_username(uname: str | None) -> str:
+    if not uname:
+        return ""
+    u = uname.strip().lstrip("@")
+    if not u or u.lower() in ("клиент", "none", "без_ника"):
+        return ""
+    if re.fullmatch(r"[A-Za-z0-9_]{3,64}", u):
+        return u
+    return ""
+
+
+async def register_user(user, force_update: bool = False):
+    uname = user.username or ""
+    fname = user.first_name or "Гость"
+
+    if user.id in KNOWN_USERS and not force_update:
         return
+
+    is_new = user.id not in KNOWN_USERS
     KNOWN_USERS.add(user.id)
     try:
         async with DB_LOCK:
+            if is_new:
+                await DB_CONN.execute(
+                    "INSERT OR IGNORE INTO users (user_id, username, first_name, joined_at) VALUES (?, ?, ?, ?)",
+                    (user.id, uname, fname, datetime.now().strftime("%d.%m.%Y"))
+                )
             await DB_CONN.execute(
-                "INSERT OR IGNORE INTO users (user_id, username, first_name, joined_at) VALUES (?, ?, ?, ?)",
-                (user.id, user.username or "Клиент", user.first_name or "Гость", datetime.now().strftime("%d.%m.%Y"))
+                "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
+                (uname, fname, user.id)
             )
             await DB_CONN.commit()
     except Exception as e:
-        KNOWN_USERS.discard(user.id)
+        if is_new:
+            KNOWN_USERS.discard(user.id)
         logging.warning(f"Ошибка регистрации пользователя {user.id}: {e}")
 
 
@@ -1262,7 +1289,6 @@ async def show_screen(target, image_name: str, caption: str, kb: InlineKeyboardM
             chat_id, msg_id = msg.chat.id, msg.message_id
             same_image = (LAST_SCREEN_IMG.get((chat_id, msg_id)) == image_name) and bool(msg.photo)
 
-            # Быстрый путь: если картинка та же — меняем только подпись и кнопки без перезагрузки медиа
             if same_image:
                 try:
                     await msg.edit_caption(caption=caption, reply_markup=kb)
@@ -1280,7 +1306,6 @@ async def show_screen(target, image_name: str, caption: str, kb: InlineKeyboardM
                 except Exception:
                     pass
 
-            # Стандартный путь: меняем картинку через edit_media
             cached_fid = PHOTO_CACHE.get(image_name)
             media_file = cached_fid or FSInputFile(os.path.join(IMG_DIR, image_name))
             try:
@@ -1302,7 +1327,6 @@ async def show_screen(target, image_name: str, caption: str, kb: InlineKeyboardM
             except Exception:
                 pass
 
-            # Резервный путь: удаляем старое сообщение и отправляем новое фото
             try:
                 await msg.delete()
             except Exception:
@@ -1317,14 +1341,54 @@ async def show_screen(target, image_name: str, caption: str, kb: InlineKeyboardM
             await _send_fresh_photo(target, image_name, caption, kb)
 
 
+async def show_dynamic_photo(call: CallbackQuery, photo_file_id: str | None, fallback_image: str, caption: str, kb: InlineKeyboardMarkup):
+    """Отображает произвольное фото (например, аватар участника) с безопасным откатом на стандартный баннер."""
+    if not photo_file_id:
+        await show_screen(call, fallback_image, caption, kb)
+        return
+
+    asyncio.create_task(_quick_answer(call))
+    lock = _get_user_lock(call.from_user.id)
+    async with lock:
+        msg = call.message
+        if not msg:
+            return
+        chat_id, msg_id = msg.chat.id, msg.message_id
+        # Сбрасываем кэш статичного экрана, чтобы при возврате назад сработал edit_media
+        LAST_SCREEN_IMG.pop((chat_id, msg_id), None)
+
+        try:
+            await msg.edit_media(
+                media=InputMediaPhoto(media=photo_file_id, caption=caption, parse_mode=ParseMode.HTML),
+                reply_markup=kb
+            )
+            return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+        except Exception:
+            pass
+
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        try:
+            await msg.answer_photo(photo=photo_file_id, caption=caption, reply_markup=kb)
+            return
+        except Exception:
+            await _send_fresh_photo(msg, fallback_image, caption, kb)
+
+
 # ================= КЛАВИАТУРЫ =================
 def reply_main_kb(user_id: int) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="🛒 Каталог"), KeyboardButton(text="👤 Профиль")],
         [KeyboardButton(text="🧶 Привязка"), KeyboardButton(text="ℹ️ Инфо"), KeyboardButton(text="📕 Правила")],
+        [KeyboardButton(text="🆘 Поддержка")],
     ]
     if user_id == ADMIN_ID:
-        rows.append([KeyboardButton(text="⚙️ Админка")])
+        rows[-1].append(KeyboardButton(text="⚙️ Админка"))
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, input_field_placeholder="Меню Bombych Store...")
 
 
@@ -1335,8 +1399,10 @@ def inline_home_kb(user_id: int) -> InlineKeyboardMarkup:
     b.button(text="🧶 Привязка", callback_data="nav_xbox")
     b.button(text="ℹ️ Инфо", callback_data="nav_info")
     b.button(text="📕 Правила", callback_data="nav_rules")
-    b.button(text="🆘 Поддержка", url=SUPPORT_LINK)
-    b.adjust(2, 2, 2)
+    b.button(text="🆘 Поддержка", callback_data="nav_support")
+    b.button(text="📄 Соглашение", callback_data="nav_terms")
+    b.button(text="🔒 Политика", callback_data="nav_privacy")
+    b.adjust(2, 2, 2, 2)
     if user_id == ADMIN_ID:
         b.row(InlineKeyboardButton(text="⚙️ Панель управления", callback_data="nav_admin"))
     return b.as_markup()
@@ -1344,12 +1410,49 @@ def inline_home_kb(user_id: int) -> InlineKeyboardMarkup:
 
 HOME_KB_USER = inline_home_kb(0)
 HOME_KB_ADMIN = inline_home_kb(ADMIN_ID)
-BACK_HOME_KB = InlineKeyboardMarkup(inline_keyboard=[
+
+INFO_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [
+        InlineKeyboardButton(text="📄 Соглашение", callback_data="nav_terms"),
+        InlineKeyboardButton(text="🔒 Политика", callback_data="nav_privacy")
+    ],
+    [
+        InlineKeyboardButton(text="🆘 Поддержка", callback_data="nav_support"),
+        InlineKeyboardButton(text="🛒 Каталог", callback_data="nav_catalog")
+    ],
+    [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_home")]
+])
+
+RULES_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [
+        InlineKeyboardButton(text="📄 Соглашение", callback_data="nav_terms"),
+        InlineKeyboardButton(text="🔒 Политика", callback_data="nav_privacy")
+    ],
     [
         InlineKeyboardButton(text="⬅️ Назад", callback_data="nav_home"),
         InlineKeyboardButton(text="🛒 Каталог", callback_data="nav_catalog")
     ]
 ])
+
+LEGAL_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [
+        InlineKeyboardButton(text="📄 Соглашение", callback_data="nav_terms"),
+        InlineKeyboardButton(text="🔒 Политика", callback_data="nav_privacy")
+    ],
+    [
+        InlineKeyboardButton(text="🆘 Поддержка", callback_data="nav_support"),
+        InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav_home")
+    ]
+])
+
+SUPPORT_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text=f"💬 Написать в Telegram ({SUPPORT_USERNAME})", url=SUPPORT_LINK)],
+    [
+        InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_home"),
+        InlineKeyboardButton(text="🛒 Каталог", callback_data="nav_catalog")
+    ]
+])
+
 BACK_XBOX_KB = InlineKeyboardMarkup(inline_keyboard=[
     [
         InlineKeyboardButton(text="⬅️ В Fortnite", callback_data="nav_fortnite"),
@@ -1367,7 +1470,8 @@ HOME_TEXT = (
     "📱 <b>Игры:</b> Brawl Stars, Roblox, Genshin, Standoff 2, Clash Royale, CoC, Free Fire, PUBG, Вирты\n"
     "💻 <b>Сервисы:</b> Telegram (Premium и Звёзды), Steam, Discord Nitro, ChatGPT, Spotify, ExitLag, Банки</blockquote>\n"
     "⏰ <b>График выдачи:</b> <code>05:00 – 22:00 (МСК)</code>\n"
-    "⚡ Прием заказов через бота — <b>круглосуточно (24/7)</b>\n\n"
+    "⚡ Прием заказов через бота — <b>круглосуточно (24/7)</b>\n"
+    "<i>Пользуясь ботом, вы соглашаетесь с Пользовательским соглашением и Политикой конфиденциальности.</i>\n\n"
     "👇 <b>Выберите нужный раздел:</b>"
 )
 
@@ -1412,6 +1516,44 @@ RULES_TEXT = (
     "и гарантируем полную выдачу оплаченного товара.</blockquote>"
 )
 
+TERMS_TEXT = (
+    "📄 <b>Пользовательское соглашение • Bombych Store</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "<blockquote><b>1. Общие положения</b>\n"
+    "Начиная использование бота Bombych Store, вы подтверждаете согласие с условиями данного соглашения.\n\n"
+    "<b>2. Оформление и оплата</b>\n"
+    "Магазин предоставляет услуги по приобретению и зачислению цифровых товаров, игровой валюты и подписок. "
+    "Заказ принимается в работу после проверки чека об оплате.\n\n"
+    "<b>3. Выдача и возврат</b>\n"
+    "Выдача производится в рабочие часы (05:00–22:00 МСК). После успешного зачисления цифрового товара возврат средств не осуществляется. "
+    "Если заказ невозможно выполнить по вине магазина, оформляется полный возврат.\n\n"
+    "<b>4. Ответственность</b>\n"
+    "Покупатель отвечает за корректность переданных данных (ID, UID, ник, регион).</blockquote>"
+)
+
+PRIVACY_TEXT = (
+    "🔒 <b>Политика конфиденциальности • Bombych Store</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "<blockquote><b>1. Какие данные собираются</b>\n"
+    "Бот сохраняет технические данные Telegram (ID, @username, имя) и историю ваших заказов для работы сервиса и поддержки.\n\n"
+    "<b>2. Данные игровых аккаунтов</b>\n"
+    "Сведения, переданные для зачисления товара, используются строго один раз для выполнения заказа и не сохраняются после выдачи.\n\n"
+    "<b>3. Защита информации</b>\n"
+    "Ваши данные не передаются и не продаются третьим лицам.\n\n"
+    "<b>4. Обращения и удаление данных</b>\n"
+    f"По вопросам обработки или удаления ваших данных обращайтесь напрямую: {SUPPORT_USERNAME}</blockquote>"
+)
+
+SUPPORT_TEXT = (
+    "🆘 <b>Поддержка • Bombych Store</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "<blockquote>По любым вопросам — помощь с выбором товара, оплата, статус заказа, "
+    "привязка аккаунта или сотрудничество — обращайтесь напрямую ко мне в Telegram.</blockquote>\n"
+    f"👤 <b>Мой контакт:</b> {SUPPORT_USERNAME}\n"
+    "⏰ <b>Время ответа:</b> <code>05:00 – 22:00 (МСК)</code>\n\n"
+    "👇 <b>Нажмите кнопку ниже, чтобы сразу написать мне:</b>"
+)
+
 XBOX_TEXT = (
     "✅ <b>Инструкция по привязке аккаунта Xbox</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
@@ -1430,7 +1572,7 @@ XBOX_TEXT = (
 async def cmd_start(message: Message, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await register_user(message.from_user)
+    await register_user(message.from_user, force_update=True)
     kb = HOME_KB_ADMIN if message.from_user.id == ADMIN_ID else HOME_KB_USER
     await message.answer(
         "💜 <b>Добро пожаловать в официальный магазин Bombych Store!</b>",
@@ -1474,14 +1616,14 @@ async def cb_fortnite(call: CallbackQuery, state: FSMContext):
 async def msg_info(message: Message, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await show_screen(message, "info.jpg", INFO_TEXT, BACK_HOME_KB)
+    await show_screen(message, "info.jpg", INFO_TEXT, INFO_KB)
 
 
 @router.callback_query(F.data == "nav_info")
 async def cb_info(call: CallbackQuery, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await show_screen(call, "info.jpg", INFO_TEXT, BACK_HOME_KB)
+    await show_screen(call, "info.jpg", INFO_TEXT, INFO_KB)
 
 
 @router.message(Command("rules"))
@@ -1489,14 +1631,42 @@ async def cb_info(call: CallbackQuery, state: FSMContext):
 async def msg_rules(message: Message, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await show_screen(message, "rules.jpg", RULES_TEXT, BACK_HOME_KB)
+    await show_screen(message, "rules.jpg", RULES_TEXT, RULES_KB)
 
 
 @router.callback_query(F.data == "nav_rules")
 async def cb_rules(call: CallbackQuery, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await show_screen(call, "rules.jpg", RULES_TEXT, BACK_HOME_KB)
+    await show_screen(call, "rules.jpg", RULES_TEXT, RULES_KB)
+
+
+@router.message(Command("terms"))
+async def msg_terms(message: Message, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
+    await show_screen(message, "terms.jpg", TERMS_TEXT, LEGAL_KB)
+
+
+@router.callback_query(F.data == "nav_terms")
+async def cb_terms(call: CallbackQuery, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
+    await show_screen(call, "terms.jpg", TERMS_TEXT, LEGAL_KB)
+
+
+@router.message(Command("privacy"))
+async def msg_privacy(message: Message, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
+    await show_screen(message, "privacy.jpg", PRIVACY_TEXT, LEGAL_KB)
+
+
+@router.callback_query(F.data == "nav_privacy")
+async def cb_privacy(call: CallbackQuery, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
+    await show_screen(call, "privacy.jpg", PRIVACY_TEXT, LEGAL_KB)
 
 
 @router.message(Command("xbox"))
@@ -1515,14 +1685,18 @@ async def cb_xbox(call: CallbackQuery, state: FSMContext):
 
 
 @router.message(Command("support"))
+@router.message(F.text == "🆘 Поддержка")
 async def cmd_support(message: Message, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Написать в поддержку", url=SUPPORT_LINK)],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav_home")]
-    ])
-    await show_screen(message, "info.jpg", "🆘 <b>Служба поддержки • Bombych Store</b>\nНажмите кнопку ниже для связи с администратором.", kb)
+    await show_screen(message, "support.jpg", SUPPORT_TEXT, SUPPORT_KB)
+
+
+@router.callback_query(F.data == "nav_support")
+async def cb_support(call: CallbackQuery, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
+    await show_screen(call, "support.jpg", SUPPORT_TEXT, SUPPORT_KB)
 
 
 # ================= ПРОФИЛЬ И ИСТОРИЯ ЗАКАЗОВ =================
@@ -1579,501 +1753,4 @@ async def msg_profile(message: Message, state: FSMContext):
     await show_screen(message, "profile.jpg", text, kb)
 
 
-@router.callback_query(F.data == "nav_profile")
-async def cb_profile(call: CallbackQuery, state: FSMContext):
-    if await state.get_state():
-        await state.clear()
-    text, kb = await build_profile_view(call.from_user)
-    await show_screen(call, "profile.jpg", text, kb)
-
-
-@router.callback_query(F.data == "my_orders")
-async def cb_my_orders(call: CallbackQuery, state: FSMContext):
-    if await state.get_state():
-        await state.clear()
-    async with DB_CONN.execute(
-        "SELECT id, product_name, price, status FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 8",
-        (call.from_user.id,)
-    ) as cur:
-        rows = await cur.fetchall()
-
-    st_icons = {
-        "pending": "⏳ Ожидает оплаты",
-        "checking": "🔎 На проверке",
-        "completed": "✅ Выдан",
-        "rejected": "❌ Отклонен"
-    }
-    if not rows:
-        body = "<i>У вас пока нет завершенных или активных заказов.</i>"
-    else:
-        body = "\n".join([
-            f"• <b>#{oid}</b> | {html.escape(pname)} (<b>{price:.0f}₽</b>) — {st_icons.get(st, st)}"
-            for oid, pname, price, st in rows
-        ])
-
-    text = f"📦 <b>История заказов</b>\n━━━━━━━━━━━━━━━━━━━━\n{body}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="⬅️ Профиль", callback_data="nav_profile"),
-            InlineKeyboardButton(text="🛒 Каталог", callback_data="nav_catalog")
-        ]
-    ])
-    await show_screen(call, "profile.jpg", text, kb)
-
-
-# ================= КАТЕГОРИИ, ТОВАРЫ И ОПЛАТА =================
-@router.callback_query(F.data.startswith("cat_"))
-async def cb_category(call: CallbackQuery, state: FSMContext):
-    if await state.get_state():
-        await state.clear()
-    try:
-        cat_id = int(call.data.split("_")[1])
-    except (IndexError, ValueError):
-        return await _quick_answer(call, "Раздел не найден", show_alert=True)
-
-    cat = RAM_CATS.get(cat_id)
-    if not cat:
-        return await _quick_answer(call, "Раздел не найден", show_alert=True)
-
-    await show_screen(call, cat["image_name"], RAM_CAT_CAPTIONS[cat_id], RAM_CAT_KBS[cat_id])
-
-
-@router.callback_query(F.data.startswith("prod_"))
-async def cb_product(call: CallbackQuery, state: FSMContext):
-    if await state.get_state():
-        await state.clear()
-    try:
-        pid = int(call.data.split("_")[1])
-    except (IndexError, ValueError):
-        return await _quick_answer(call, "Товар не найден", show_alert=True)
-
-    prod = RAM_PRODS.get(pid)
-    if not prod:
-        return await _quick_answer(call, "Товар не найден", show_alert=True)
-
-    cat = RAM_CATS[prod["category_id"]]
-    caption = (
-        f"🛍 <b>Оформление заказа</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📂 Категория: <b>{cat['full_title']}</b>\n"
-        f"💎 Товар: <b>{html.escape(prod['full_name'])}</b>\n"
-        f"💰 Стоимость: <s>{prod['old_price']:.0f} ₽</s> <b><code>{prod['price']:.0f} ₽</code></b>\n\n"
-        f"<blockquote>{cat['description']}</blockquote>\n"
-        f"👇 <b>Выберите удобный способ оплаты:</b>"
-    )
-    b = InlineKeyboardBuilder()
-    b.button(text="🧡 DonationAlerts", callback_data=f"pay_da_{pid}")
-    b.button(text="🪙 Криптовалюта", callback_data=f"pay_crypto_{pid}")
-    b.button(text="💳 СБП / Карта", callback_data="pay_sbp_soon")
-    b.button(text="⬅️ Назад", callback_data=f"cat_{prod['category_id']}")
-    if prod["category_id"] in FORTNITE_CAT_IDS:
-        b.button(text="🎮 Fortnite", callback_data="nav_fortnite")
-    else:
-        b.button(text="🛒 Каталог", callback_data="nav_catalog")
-    b.adjust(2, 1, 2)
-    await show_screen(call, prod["image_name"], caption, b.as_markup())
-
-
-@router.callback_query(F.data == "pay_sbp_soon")
-async def cb_sbp_soon(call: CallbackQuery):
-    await _quick_answer(
-        call,
-        "⏳ Оплата по СБП в скором времени будет добавлена!\n"
-        "Сейчас доступны DonationAlerts и Криптовалюта.",
-        show_alert=True
-    )
-
-
-@router.callback_query(F.data.startswith("pay_da_") | F.data.startswith("pay_crypto_"))
-async def cb_pay(call: CallbackQuery, state: FSMContext):
-    asyncio.create_task(_quick_answer(call))
-    parts = call.data.split("_")
-    try:
-        method, pid = parts[1], int(parts[2])
-    except (IndexError, ValueError):
-        return await _quick_answer(call, "Ошибка товара", show_alert=True)
-
-    prod = RAM_PRODS.get(pid)
-    if not prod:
-        return await _quick_answer(call, "Товар не найден", show_alert=True)
-
-    m_name = "DonationAlerts" if method == "da" else "Криптовалюта"
-    async with DB_LOCK:
-        async with DB_CONN.execute(
-            "INSERT INTO orders (user_id, product_name, price, pay_method, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-            (call.from_user.id, prod["full_name"], prod["price"], m_name, datetime.now().strftime("%d.%m.%Y %H:%M"))
-        ) as cur:
-            order_id = cur.lastrowid
-        await DB_CONN.commit()
-
-    await state.update_data(order_id=order_id, fname=prod["full_name"], price=prod["price"], pid=pid)
-    pay_info = PAYMENT_DA_TEXT if method == "da" else PAYMENT_CRYPTO_TEXT
-
-    caption = (
-        f"🧾 <b>Счет на оплату • Заказ #{order_id}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💎 Товар: <b>{html.escape(prod['full_name'])}</b>\n"
-        f"💰 К оплате: <b><code>{prod['price']:.0f} ₽</code></b>\n\n"
-        f"{pay_info}"
-    )
-
-    buttons = []
-    if method == "da":
-        buttons.append([InlineKeyboardButton(text="🧡 Перейти к оплате (DonationAlerts)", url=DONATIONALERTS_URL)])
-    buttons.append([InlineKeyboardButton(text="📸 Отправить чек", callback_data=f"sendcheck_{order_id}_{pid}")])
-    buttons.append([
-        InlineKeyboardButton(text="⬅️ Назад", callback_data=f"prod_{pid}"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data=f"cat_{prod['category_id']}")
-    ])
-
-    await show_screen(call, prod["image_name"], caption, InlineKeyboardMarkup(inline_keyboard=buttons))
-
-
-@router.callback_query(F.data.startswith("sendcheck_"))
-async def cb_sendcheck(call: CallbackQuery, state: FSMContext):
-    asyncio.create_task(_quick_answer(call))
-    parts = call.data.split("_")
-    data = await state.get_data()
-
-    try:
-        order_id = int(parts[1])
-    except (IndexError, ValueError):
-        order_id = data.get("order_id", 0)
-
-    try:
-        pid = int(parts[2])
-    except (IndexError, ValueError):
-        pid = data.get("pid", 1)
-
-    fname = data.get("fname")
-    price = data.get("price")
-
-    # Если бот перезапускался, восстанавливаем данные заказа из БД
-    if (not fname or price is None) and order_id:
-        async with DB_CONN.execute("SELECT product_name, price FROM orders WHERE id = ?", (order_id,)) as cur:
-            row = await cur.fetchone()
-            if row:
-                fname, price = row
-
-    await state.update_data(order_id=order_id, fname=fname or "Товар", price=price or 0, pid=pid)
-    await state.set_state(OrderFlow.waiting_receipt)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="⬅️ К товару", callback_data=f"prod_{pid}"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data="nav_home")
-        ]
-    ])
-    await call.message.answer(
-        f"📸 <b>Прикрепите скриншот или файл чека по заказу #{order_id} в этот чат.</b>\n"
-        "<i>В подписи к файлу вы можете сразу указать игровой ID, UID, тег или почту для быстрого выполнения заказа.</i>",
-        reply_markup=kb
-    )
-
-
-@router.message(OrderFlow.waiting_receipt, F.photo | F.document)
-async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
-    data = await state.get_data()
-    order_id = data.get("order_id", 0)
-    fname = data.get("fname", "Товар")
-    price = data.get("price", 0)
-    comment = html.escape(message.caption or "Без комментария")
-    await state.clear()
-
-    if order_id:
-        async with DB_LOCK:
-            await DB_CONN.execute("UPDATE orders SET status = 'checking' WHERE id = ?", (order_id,))
-            await DB_CONN.commit()
-
-    adm_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Выдать заказ", callback_data=f"adm_ok_{order_id}_{message.from_user.id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm_no_{order_id}_{message.from_user.id}")
-        ]
-    ])
-    safe_user = html.escape(message.from_user.username or "без_ника")
-    adm_caption = (
-        f"🔔 <b>Новый чек • Заказ #{order_id}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 Клиент: @{safe_user} (<code>{message.from_user.id}</code>)\n"
-        f"💎 Товар: <b>{html.escape(str(fname))}</b>\n"
-        f"💰 Сумма: <b>{price:.0f} ₽</b>\n"
-        f"💬 Комментарий: <blockquote>{comment}</blockquote>"
-    )
-
-    try:
-        if message.photo:
-            await bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=adm_caption, reply_markup=adm_kb)
-        else:
-            await bot.send_document(chat_id=ADMIN_ID, document=message.document.file_id, caption=adm_caption, reply_markup=adm_kb)
-    except Exception as e:
-        logging.error(f"Не удалось переслать чек #{order_id} администратору: {e}")
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📦 Мои заказы", callback_data="my_orders"),
-            InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav_home")
-        ]
-    ])
-    await message.answer(
-        f"✅ <b>Чек по заказу #{order_id} отправлен на проверку!</b>\n"
-        "Уведомление о выполнении заказа придет в этот чат.",
-        reply_markup=kb
-    )
-
-
-@router.message(OrderFlow.waiting_receipt)
-async def wrong_receipt(message: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отменить отправку чека", callback_data="nav_home")]
-    ])
-    await message.answer("⚠️ Пожалуйста, отправьте <b>скриншот, фотографию или файл</b> чека.", reply_markup=kb)
-
-
-# ================= АДМИН-ПАНЕЛЬ =================
-@router.callback_query(F.data.startswith("adm_ok_"))
-async def cb_adm_ok(call: CallbackQuery, bot: Bot):
-    if call.from_user.id != ADMIN_ID:
-        return await _quick_answer(call)
-    _, _, oid_s, uid_s = call.data.split("_")
-    oid, uid = int(oid_s), int(uid_s)
-
-    async with DB_LOCK:
-        await DB_CONN.execute("UPDATE orders SET status = 'completed' WHERE id = ?", (oid,))
-        await DB_CONN.commit()
-
-    try:
-        await bot.send_message(
-            chat_id=uid,
-            text=(
-                f"🎉 <b>Оплата по заказу #{oid} подтверждена!</b>\n"
-                "Ваш заказ принят к выдаче. При необходимости уточнения данных администратор свяжется с вами в ЛС.\n"
-                "💜 Спасибо за покупку в <b>Bombych Store</b>!"
-            )
-        )
-    except Exception as e:
-        logging.warning(f"Не удалось уведомить клиента {uid} о заказе #{oid}: {e}")
-
-    try:
-        await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ <b>ВЫПОЛНЕНО</b>")
-    except Exception:
-        pass
-    await _quick_answer(call, "Заказ подтвержден!")
-
-
-@router.callback_query(F.data.startswith("adm_no_"))
-async def cb_adm_no(call: CallbackQuery, bot: Bot):
-    if call.from_user.id != ADMIN_ID:
-        return await _quick_answer(call)
-    _, _, oid_s, uid_s = call.data.split("_")
-    oid, uid = int(oid_s), int(uid_s)
-
-    async with DB_LOCK:
-        await DB_CONN.execute("UPDATE orders SET status = 'rejected' WHERE id = ?", (oid,))
-        await DB_CONN.commit()
-
-    try:
-        await bot.send_message(
-            chat_id=uid,
-            text=f"❌ <b>Заказ #{oid} отклонен.</b>\nОплата не найдена. Проверьте чек или обратитесь в поддержку."
-        )
-    except Exception as e:
-        logging.warning(f"Не удалось уведомить клиента {uid} об отказе #{oid}: {e}")
-
-    try:
-        await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n❌ <b>ОТКЛОНЕНО</b>")
-    except Exception:
-        pass
-    await _quick_answer(call, "Отклонено.")
-
-
-@router.message(Command("admin"))
-@router.message(F.text.in_({"⚙️ Админка", "⚙️ Админ-панель"}))
-async def msg_admin(message: Message, state: FSMContext):
-    if await state.get_state():
-        await state.clear()
-    if message.from_user.id == ADMIN_ID:
-        await render_admin(message)
-
-
-@router.callback_query(F.data == "nav_admin")
-async def cb_admin(call: CallbackQuery, state: FSMContext):
-    if await state.get_state():
-        await state.clear()
-    if call.from_user.id == ADMIN_ID:
-        await render_admin(call)
-    else:
-        await _quick_answer(call)
-
-
-async def render_admin(target):
-    async with DB_CONN.execute("SELECT COUNT(*) FROM users") as cur:
-        u_cnt = (await cur.fetchone())[0]
-    async with DB_CONN.execute("SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE status = 'completed'") as cur:
-        o_cnt, rev = await cur.fetchone()
-
-    text = (
-        "⚙️ <b>Панель управления • Bombych Store</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 <b>Клиентов в базе:</b> <code>{u_cnt}</code>\n"
-        f"✅ <b>Выполнено заказов:</b> <code>{o_cnt}</code>\n"
-        f"💰 <b>Общая выручка:</b> <code>{rev:.0f} ₽</code>"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="➕ Добавить товар", callback_data="adm_add_item"),
-            InlineKeyboardButton(text="📢 Рассылка", callback_data="adm_broadcast")
-        ],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav_home")]
-    ])
-    await show_screen(target, "main.jpg", text, kb)
-
-
-@router.callback_query(F.data == "adm_add_item")
-async def cb_adm_add_item(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return await _quick_answer(call)
-    asyncio.create_task(_quick_answer(call))
-    b = InlineKeyboardBuilder()
-    for cid in RAM_CAT_ORDER:
-        label = f"FN: {RAM_CATS[cid]['short_name']}" if cid in FORTNITE_CAT_IDS else RAM_CATS[cid]["short_name"]
-        b.button(text=label, callback_data=f"admcat_{cid}")
-    b.adjust(2)
-    b.row(InlineKeyboardButton(text="⬅️ Отмена", callback_data="nav_admin"))
-    await call.message.answer("📂 <b>Выберите категорию для нового товара:</b>", reply_markup=b.as_markup())
-
-
-@router.callback_query(F.data.startswith("admcat_"))
-async def cb_adm_pick_cat(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_ID:
-        return await _quick_answer(call)
-    asyncio.create_task(_quick_answer(call))
-    cid = int(call.data.split("_")[1])
-    await state.update_data(cid=cid)
-    await state.set_state(AdminFlow.add_full_name)
-    await call.message.answer("✏️ Введите <b>полное название товара</b> (например: <code>4500 В-Баксов</code>):")
-
-
-@router.message(AdminFlow.add_full_name)
-async def adm_set_fname(message: Message, state: FSMContext):
-    await state.update_data(fname=(message.text or "").strip())
-    await state.set_state(AdminFlow.add_short_btn)
-    await message.answer("🔘 Введите <b>короткое название для кнопки</b> до 10 символов (например: <code>💎 4500 ВБ</code>):")
-
-
-@router.message(AdminFlow.add_short_btn)
-async def adm_set_sbtn(message: Message, state: FSMContext):
-    await state.update_data(sbtn=(message.text or "").strip())
-    await state.set_state(AdminFlow.add_price)
-    await message.answer("💰 Введите <b>цену в рублях</b> (бот сам сделает скидку -20%, либо введите две цены через пробел: <code>старая новая</code>):")
-
-
-@router.message(AdminFlow.add_price)
-async def adm_save_product(message: Message, state: FSMContext):
-    parts = (message.text or "").replace(",", ".").split()
-    try:
-        if len(parts) >= 2:
-            old_p, new_p = int(float(parts[0])), int(float(parts[1]))
-        else:
-            old_p = int(float(parts[0]))
-            new_p = max(10, int(round(old_p * 0.80)))
-    except (ValueError, IndexError):
-        return await message.answer("⚠️ Введите число (например <code>500</code> или <code>500 400</code>):")
-
-    data = await state.get_data()
-    await state.clear()
-
-    cimg = RAM_CATS.get(data["cid"], {}).get("image_name", "catalog.jpg")
-    btn_lbl = f"{data['sbtn']} • {new_p}₽"
-    async with DB_LOCK:
-        await DB_CONN.execute(
-            "INSERT INTO products (category_id, full_name, btn_label, old_price, price, image_name) VALUES (?, ?, ?, ?, ?, ?)",
-            (data["cid"], data["fname"], btn_lbl, old_p, new_p, cimg)
-        )
-        await DB_CONN.commit()
-    await reload_catalog_cache()
-
-    await message.answer(
-        f"✅ Товар <b>{html.escape(data['fname'])}</b> добавлен!\n"
-        f"Цена: <s>{old_p}₽</s> → <b>{new_p}₽</b> (Кнопка: <code>{html.escape(btn_lbl)}</code>)"
-    )
-
-
-@router.callback_query(F.data == "adm_broadcast")
-async def cb_broadcast(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != ADMIN_ID:
-        return await _quick_answer(call)
-    asyncio.create_task(_quick_answer(call))
-    await state.set_state(AdminFlow.waiting_broadcast)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="nav_admin")]])
-    await call.message.answer("📢 Введите текст рассылки для всех клиентов:", reply_markup=kb)
-
-
-@router.message(AdminFlow.waiting_broadcast)
-async def run_broadcast(message: Message, state: FSMContext, bot: Bot):
-    await state.clear()
-    async with DB_CONN.execute("SELECT user_id FROM users") as cur:
-        users = await cur.fetchall()
-    safe_text = html.escape(message.text or "")
-    sent = 0
-    for (uid,) in users:
-        try:
-            await bot.send_message(uid, f"📢 <b>Новости • Bombych Store</b>\n\n{safe_text}")
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
-    await message.answer(f"✅ Рассылка доставлена <b>{sent}</b> клиентам.")
-
-
-# ================= ГЛОБАЛЬНЫЙ ПЕРЕХВАТЧИК ОШИБОК =================
-@router.error()
-async def global_error_handler(event: ErrorEvent):
-    logging.exception(f"Необработанная ошибка в апдейте: {event.exception}")
-    if event.update.callback_query:
-        await _quick_answer(event.update.callback_query, "⚠️ Произошла временная ошибка, попробуйте ещё раз.")
-
-
-# ================= МЕНЮ «☰» И ЗАПУСК =================
-async def setup_menu_commands(bot: Bot):
-    cmds = [
-        BotCommand(command="start", description="🏠 Главное меню"),
-        BotCommand(command="catalog", description="🛒 Каталог товаров"),
-        BotCommand(command="profile", description="👤 Личный кабинет"),
-        BotCommand(command="xbox", description="🧶 Привязка Xbox"),
-        BotCommand(command="info", description="ℹ️ Информация"),
-        BotCommand(command="rules", description="📕 Правила"),
-        BotCommand(command="support", description="🆘 Поддержка"),
-    ]
-    await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
-
-
-async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Не найден BOT_TOKEN! Укажите токен бота во вкладке «Переменные» на хостинге.")
-
-    prepare_all_banners()
-    await init_db_and_cache()
-
-    session = AiohttpSession(timeout=25)
-    bot = Bot(token=BOT_TOKEN, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    await setup_menu_commands(bot)
-
-    dp = Dispatcher()
-    dp.include_router(router)
-    await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Bombych Store v12 успешно запущен!")
-    try:
-        await dp.start_polling(
-            bot,
-            allowed_updates=dp.resolve_used_update_types(),
-            polling_timeout=25
-        )
-    finally:
-        await bot.session.close()
-        if DB_CONN:
-            await DB_CONN.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+@router.callback
