@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict
@@ -30,7 +31,8 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    Message, CallbackQuery, ErrorEvent, FSInputFile, InputMediaPhoto,
+    Message, CallbackQuery, ErrorEvent, FSInputFile,
+    InputMediaPhoto, InputMediaDocument,
     ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
     BotCommand, BotCommandScopeDefault, TelegramObject
@@ -53,11 +55,12 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 CURRENT_DB_NAME = "bombystore_v10.db"
 DB_PATH = os.path.join(DATA_DIR, CURRENT_DB_NAME)
-IMG_DIR = os.path.join(BASE_DIR, "assets_v15")
+IMG_DIR = os.path.join(BASE_DIR, "assets_v16")
 CATALOG_SCHEMA_VERSION = "v12_fortnite_folder"
 
 FORTNITE_CAT_IDS = (1, 2, 3)
 USERS_PER_PAGE = 8
+REQ_TIMEOUT = 15
 
 PAYMENT_DA_TEXT = (
     "🧡 <b>Оплата через DonationAlerts:</b>\n"
@@ -76,12 +79,11 @@ PAYMENT_CRYPTO_TEXT = (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 router = Router()
 
-# ================= ГЛОБАЛЬНЫЙ КЭШ, БЛОКИРОВКИ И БД =================
+# ================= ГЛОБАЛЬНЫЙ КЭШ И СОСТОЯНИЕ =================
 DB_CONN: aiosqlite.Connection | None = None
 DB_LOCK = asyncio.Lock()
-USER_LOCKS: dict[int, asyncio.Lock] = {}
-LAST_SCREEN_IMG: dict[tuple[int, int], str] = {}
-AUX_MSGS: dict[tuple[int, int], list[int]] = {}
+LAST_SCREEN_TAG: dict[tuple[int, int], str] = {}
+LAST_CLICK: dict[tuple[int, str], float] = {}
 
 PHOTO_CACHE: dict[str, str] = {}
 DOC_CACHE: dict[str, str] = {}
@@ -353,7 +355,6 @@ CATEGORIES_DATA = [
     ),
 ]
 
-# Оригинальные файлы пользователя из папки img/ или корня (подхватываются без учёта регистра)
 USER_UPLOADED_MAP = {
     "logo.jpg": ["4.jpg", "logo.jpg", "logo.png"],
     "vbucks.jpg": ["vbucks.jpg", "1 (1).jpg", "1_3.jpg", "vbucks.png"],
@@ -378,7 +379,7 @@ SERVICE_BANNERS = [
     ("privacy.jpg", "cyan_night", ("ПОЛИТИКА", "КОНФИДЕНЦИАЛЬНОСТИ")),
 ]
 
-# ================= СОДЕРЖИМОЕ ЮРИДИЧЕСКИХ ДОКУМЕНТОВ (ДЛЯ ФАЙЛОВ) =================
+# ================= СОДЕРЖИМОЕ PDF-ДОКУМЕНТОВ =================
 TERMS_SECTIONS = [
     (
         "1. Общие положения",
@@ -482,7 +483,6 @@ PRIVACY_SECTIONS = [
 
 # ================= АВТООЧИСТКА СТАРЫХ ПАПОК И БД =================
 def cleanup_old_files():
-    """Удаляет устаревшие папки (assets_v*, img_v* кроме текущей) и старые БД. Папку img/ НЕ трогает."""
     removed_items = []
     current_img_folder = os.path.basename(IMG_DIR)
 
@@ -509,7 +509,7 @@ def cleanup_old_files():
         logging.info(f"Автоочистка выполнена. Удалено: {', '.join(removed_items)}")
 
 
-# ================= ГЕНЕРАТОР АТМОСФЕРНЫХ СЦЕН И PDF-ДОКУМЕНТОВ =================
+# ================= ГЕНЕРАТОР БАННЕРОВ И PDF-ДОКУМЕНТОВ =================
 THEME_PALETTES = {
     "purple_forest": {
         "bg": (5, 7, 22),
@@ -611,7 +611,6 @@ THEME_PALETTES = {
 
 
 def _find_user_file(filenames: list) -> str | None:
-    """Ищет файл в img/, images/, корне проекта (без учёта регистра на Linux)."""
     home = os.path.expanduser("~")
     dirs = [
         os.path.join(BASE_DIR, "img"),
@@ -655,7 +654,7 @@ def _download_font_file(urls: list[str], dest_path: str) -> str | None:
     for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=6) as resp:
                 data = resp.read()
             if len(data) > 10000:
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
@@ -721,49 +720,28 @@ def _resolve_font_path() -> str | None:
             try:
                 ImageFont.truetype(p, 48)
                 _RESOLVED_FONT_PATH = p
-                logging.info(f"Системный шрифт загружен: {p}")
                 return p
             except Exception:
                 pass
 
-    bold_found, any_found = [], []
-    for search_root in ("/usr/share/fonts", "/usr/local/share/fonts"):
-        if os.path.isdir(search_root):
-            for root, _, files in os.walk(search_root):
-                for f in files:
-                    fl = f.lower()
-                    if fl.endswith((".ttf", ".otf")):
-                        full_p = os.path.join(root, f)
-                        if "bold" in fl or "black" in fl or "heavy" in fl:
-                            bold_found.append(full_p)
-                        else:
-                            any_found.append(full_p)
-
-    for p in bold_found + any_found:
-        try:
-            ImageFont.truetype(p, 48)
-            _RESOLVED_FONT_PATH = p
-            return p
-        except Exception:
-            continue
-
     downloaded = _download_font_file(
         [
-            "https://github.com/google/fonts/raw/main/apache/roboto/static/Roboto-Bold.ttf",
-            "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
+            "https://raw.githubusercontent.com/google/fonts/main/ofl/ptsans/PTSans-Bold.ttf",
+            "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ptsans/PTSans-Bold.ttf",
+            "https://raw.githubusercontent.com/google/fonts/main/ofl/ubuntu/Ubuntu-Bold.ttf",
         ],
-        os.path.join("/tmp", "BombychFont-Bold.ttf")
+        os.path.join(IMG_DIR, "_banner_bold.ttf")
     )
     if downloaded:
         _RESOLVED_FONT_PATH = downloaded
         return downloaded
-
     return None
 
 
 def _resolve_doc_fonts() -> tuple[str | None, str | None]:
-    """Ищет аккуратный читаемый шрифт (обычный + жирный) для PDF-документов (не Impact)."""
+    """Находит или скачивает чистый кириллический шрифт (PT Sans / Ubuntu / Arial) для PDF-документов."""
     reg_candidates = [
+        os.path.join(IMG_DIR, "_doc_regular.ttf"),
         "C:\\Windows\\Fonts\\arial.ttf",
         "C:\\Windows\\Fonts\\segoeui.ttf",
         "C:\\Windows\\Fonts\\calibri.ttf",
@@ -772,6 +750,7 @@ def _resolve_doc_fonts() -> tuple[str | None, str | None]:
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
     ]
     bold_candidates = [
+        os.path.join(IMG_DIR, "_doc_bold.ttf"),
         "C:\\Windows\\Fonts\\arialbd.ttf",
         "C:\\Windows\\Fonts\\segoeuib.ttf",
         "C:\\Windows\\Fonts\\calibrib.ttf",
@@ -803,19 +782,30 @@ def _resolve_doc_fonts() -> tuple[str | None, str | None]:
     if not reg_path:
         reg_path = _download_font_file(
             [
-                "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf",
-                "https://github.com/google/fonts/raw/main/apache/roboto/static/Roboto-Regular.ttf",
+                "https://raw.githubusercontent.com/google/fonts/main/ofl/ptsans/PTSans-Regular.ttf",
+                "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ptsans/PTSans-Regular.ttf",
+                "https://raw.githubusercontent.com/google/fonts/main/ofl/ubuntu/Ubuntu-Regular.ttf",
+                "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ubuntu/Ubuntu-Regular.ttf",
             ],
-            os.path.join("/tmp", "BombychDoc-Regular.ttf")
+            os.path.join(IMG_DIR, "_doc_regular.ttf")
         )
     if not bold_path:
         bold_path = _download_font_file(
             [
-                "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
-                "https://github.com/google/fonts/raw/main/apache/roboto/static/Roboto-Bold.ttf",
+                "https://raw.githubusercontent.com/google/fonts/main/ofl/ptsans/PTSans-Bold.ttf",
+                "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ptsans/PTSans-Bold.ttf",
+                "https://raw.githubusercontent.com/google/fonts/main/ofl/ubuntu/Ubuntu-Bold.ttf",
+                "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ubuntu/Ubuntu-Bold.ttf",
             ],
-            os.path.join("/tmp", "BombychDoc-Bold.ttf")
+            os.path.join(IMG_DIR, "_doc_bold.ttf")
         ) or reg_path
+
+    # Полный офлайн-резерв: используем шрифт из проекта (impact.ttf), чтобы всё равно собрать PDF
+    if not reg_path:
+        fallback = _resolve_font_path()
+        if fallback:
+            reg_path = fallback
+            bold_path = fallback
 
     return reg_path, bold_path
 
@@ -858,7 +848,6 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_w: int) -> list[s
                 lines.append(cur)
                 cur = word
             else:
-                # Разбиение слишком длинного слова
                 chunk = ""
                 for ch in word:
                     if draw.textlength(chunk + ch, font=font) <= max_w:
@@ -873,30 +862,43 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_w: int) -> list[s
     return lines
 
 
+def _make_doc_thumbnail(banner_path: str, thumb_path: str):
+    """Создаёт квадратную обложку 320x320 (< 200 КБ) для предпросмотра PDF прямо в чате Telegram."""
+    src = Image.open(banner_path).convert("RGB")
+    bg = src.resize((320, 320), Image.Resampling.BILINEAR).filter(ImageFilter.GaussianBlur(12))
+    # Слегка затемняем фон, чтобы центр читался чётко
+    bg = Image.blend(bg, Image.new("RGB", (320, 320), (10, 6, 26)), 0.45)
+
+    bw = 320
+    bh = int(src.height * (bw / src.width))
+    fg = src.resize((bw, bh), Image.Resampling.LANCZOS)
+    bg.paste(fg, (0, (320 - bh) // 2))
+    bg.save(thumb_path, "JPEG", quality=85, optimize=True)
+
+
 def _generate_legal_pdf(
     pdf_path: str,
+    banner_path: str,
     title: str,
     subtitle: str,
     sections: list[tuple[str, list[str]]],
     reg_font_path: str,
     bold_font_path: str
 ):
-    """Создаёт аккуратный многостраничный PDF-документ формата A4 средствами Pillow."""
+    """Собирает многостраничный PDF (A4) с фирменным баннером на 1-й странице."""
     W, H = 1000, 1414
     ML, MR, MT, MB = 68, 68, 64, 88
     CONTENT_W = W - ML - MR
 
-    f_brand = ImageFont.truetype(bold_font_path, 20)
-    f_sub = ImageFont.truetype(reg_font_path, 17)
+    f_sub = ImageFont.truetype(reg_font_path, 16)
     f_sec = ImageFont.truetype(bold_font_path, 22)
     f_body = ImageFont.truetype(reg_font_path, 19)
     f_foot = ImageFont.truetype(reg_font_path, 15)
 
-    # Автоподбор размера заголовка документа
-    t_sz = 32
+    t_sz = 28
     f_title = ImageFont.truetype(bold_font_path, t_sz)
     tmp_dr = ImageDraw.Draw(Image.new("RGB", (10, 10)))
-    while t_sz > 22 and tmp_dr.textlength(title, font=f_title) > CONTENT_W:
+    while t_sz > 20 and tmp_dr.textlength(title, font=f_title) > CONTENT_W:
         t_sz -= 2
         f_title = ImageFont.truetype(bold_font_path, t_sz)
 
@@ -906,12 +908,19 @@ def _generate_legal_pdf(
         pg = Image.new("RGB", (W, H), (255, 255, 255))
         dr = ImageDraw.Draw(pg)
         if first:
-            dr.rectangle([0, 0, W, 166], fill=(18, 10, 38))
-            dr.rectangle([0, 166, W, 173], fill=(138, 43, 226))
-            dr.text((ML, 30), "BOMBYCH STORE  •  ОФИЦИАЛЬНЫЙ ДОКУМЕНТ", font=f_brand, fill=(195, 160, 255))
-            dr.text((ML, 68), title, font=f_title, fill=(255, 255, 255))
-            dr.text((ML, 120), subtitle, font=f_sub, fill=(188, 195, 220))
-            return pg, dr, 212
+            y_cursor = 0
+            if os.path.exists(banner_path):
+                b_img = Image.open(banner_path).convert("RGB")
+                bh = int(b_img.height * (W / b_img.width))
+                pg.paste(b_img.resize((W, bh), Image.Resampling.LANCZOS), (0, 0))
+                y_cursor = bh
+            dr.rectangle([0, y_cursor, W, y_cursor + 6], fill=(138, 43, 226))
+            y_cursor += 28
+            dr.text((ML, y_cursor), title, font=f_title, fill=(24, 16, 48))
+            y_cursor += 38
+            dr.text((ML, y_cursor), subtitle, font=f_sub, fill=(112, 116, 134))
+            y_cursor += 34
+            return pg, dr, y_cursor
         else:
             dr.rectangle([0, 0, W, 8], fill=(138, 43, 226))
             return pg, dr, MT
@@ -919,7 +928,7 @@ def _generate_legal_pdf(
     page, draw, y = new_page(first=True)
     pages.append(page)
 
-    line_h = 28
+    line_h = 27
     for sec_title, paragraphs in sections:
         if y + 84 > H - MB:
             page, draw, y = new_page(first=False)
@@ -940,8 +949,8 @@ def _generate_legal_pdf(
                     pages.append(page)
                 draw.text((ML + indent, y), ln, font=f_body, fill=(32, 34, 44))
                 y += line_h
-            y += 10
-        y += 14
+            y += 9
+        y += 12
 
     total_pages = len(pages)
     for idx, pg in enumerate(pages, start=1):
@@ -980,7 +989,6 @@ def _generate_legal_txt(txt_path: str, title: str, subtitle: str, sections: list
 
 
 def prepare_legal_documents():
-    """Генерирует аккуратные файлы Соглашения и Политики (PDF, при отсутствии шрифтов — TXT)."""
     os.makedirs(IMG_DIR, exist_ok=True)
     reg_font, bold_font = _resolve_doc_fonts()
     use_pdf = bool(reg_font and bold_font)
@@ -988,16 +996,18 @@ def prepare_legal_documents():
     docs_spec = [
         (
             "terms",
+            "terms.jpg",
             "Пользовательское соглашение",
-            "Правила использования сервиса Bombych Store • Актуальная редакция",
+            "Bombych Store • Актуальная редакция",
             TERMS_SECTIONS,
             "terms_doc",
             "Пользовательское_соглашение_BombychStore",
         ),
         (
             "privacy",
+            "privacy.jpg",
             "Политика конфиденциальности",
-            "Порядок обработки и защиты данных Bombych Store • Актуальная редакция",
+            "Bombych Store • Актуальная редакция",
             PRIVACY_SECTIONS,
             "privacy_doc",
             "Политика_конфиденциальности_BombychStore",
@@ -1005,7 +1015,12 @@ def prepare_legal_documents():
     ]
 
     DOC_META.clear()
-    for key, title, subtitle, sections, disk_base, send_base in docs_spec:
+    for key, banner_name, title, subtitle, sections, disk_base, send_base in docs_spec:
+        banner_path = os.path.join(IMG_DIR, banner_name)
+        thumb_path = os.path.join(IMG_DIR, f"{key}_thumb.jpg")
+        if os.path.exists(banner_path):
+            _make_doc_thumbnail(banner_path, thumb_path)
+
         ext = ".pdf" if use_pdf else ".txt"
         disk_name = f"{disk_base}{ext}"
         disk_path = os.path.join(IMG_DIR, disk_name)
@@ -1013,9 +1028,10 @@ def prepare_legal_documents():
 
         if use_pdf:
             try:
-                _generate_legal_pdf(disk_path, title, subtitle, sections, reg_font, bold_font)
+                _generate_legal_pdf(disk_path, banner_path, title, subtitle, sections, reg_font, bold_font)
+                logging.info(f"PDF-документ создан: {disk_name}")
             except Exception as e:
-                logging.warning(f"Не удалось собрать PDF {key}, переход на TXT: {e}")
+                logging.warning(f"Ошибка PDF {key}, переход на TXT: {e}")
                 ext = ".txt"
                 disk_name = f"{disk_base}{ext}"
                 disk_path = os.path.join(IMG_DIR, disk_name)
@@ -1027,11 +1043,14 @@ def prepare_legal_documents():
         cache_key = f"doc:{key}"
         DOC_META[key] = {
             "disk_path": disk_path,
-            "disk_name": disk_name,
+            "thumb_path": thumb_path,
             "send_name": send_name,
             "cache_key": cache_key,
         }
-        FILE_HASHES[cache_key] = _file_md5(disk_path)
+        # Включаем в хэш и сам PDF, и его обложку
+        h_doc = _file_md5(disk_path)
+        h_th = _file_md5(thumb_path) if os.path.exists(thumb_path) else ""
+        FILE_HASHES[cache_key] = f"{h_doc}:{h_th}"
 
 
 def _make_fallback_logo() -> Image.Image:
@@ -1346,7 +1365,7 @@ def prepare_all_banners():
 
     FILE_HASHES.clear()
     for fname in os.listdir(IMG_DIR):
-        if fname.endswith((".jpg", ".png")):
+        if fname.endswith((".jpg", ".png")) and not fname.endswith("_thumb.jpg"):
             FILE_HASHES[fname] = _file_md5(os.path.join(IMG_DIR, fname))
 
     prepare_legal_documents()
@@ -1487,6 +1506,7 @@ async def init_db_and_cache():
                 if acc == 1:
                     ACCEPTED_USERS.add(uid)
 
+    logging.info(f"БД загружена ({DB_PATH}): участников={len(KNOWN_USERS)}, приняли условия={len(ACCEPTED_USERS)}")
     await reload_catalog_cache()
 
 
@@ -1648,51 +1668,42 @@ async def set_user_accepted(user, accepted: bool):
         ACCEPTED_USERS.discard(user.id)
 
 
-# ================= ЗАЩИЩЁННАЯ ОТ ЗАВИСАНИЙ ОТРИСОВКА ЭКРАНОВ =================
-def _plain_len(html_text: str) -> int:
-    return len(html.unescape(re.sub(r"<[^>]+>", "", html_text)))
+# ================= БЫСТРАЯ ОТРИСОВКА ЭКРАНОВ БЕЗ БЛОКИРОВОК =================
+def _is_duplicate_click(user_id: int, data: str | None) -> bool:
+    if not data:
+        return False
+    now = time.monotonic()
+    if len(LAST_CLICK) > 4000:
+        cutoff = now - 5.0
+        for k in [k for k, v in LAST_CLICK.items() if v < cutoff]:
+            LAST_CLICK.pop(k, None)
+    key = (user_id, data)
+    prev = LAST_CLICK.get(key, 0.0)
+    if now - prev < 0.35:
+        return True
+    LAST_CLICK[key] = now
+    return False
 
 
-def _get_user_lock(user_id: int) -> asyncio.Lock:
-    if len(USER_LOCKS) > 2000:
-        for uid in list(USER_LOCKS.keys())[:1000]:
-            if not USER_LOCKS[uid].locked():
-                USER_LOCKS.pop(uid, None)
-    lock = USER_LOCKS.get(user_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        USER_LOCKS[user_id] = lock
-    return lock
+def _remember_screen(chat_id: int, message_id: int, tag: str):
+    if len(LAST_SCREEN_TAG) > 5000:
+        for k in list(LAST_SCREEN_TAG.keys())[:2500]:
+            LAST_SCREEN_TAG.pop(k, None)
+    LAST_SCREEN_TAG[(chat_id, message_id)] = tag
 
 
-def _remember_screen(chat_id: int, message_id: int, screen_tag: str):
-    if len(LAST_SCREEN_IMG) > 5000:
-        for k in list(LAST_SCREEN_IMG.keys())[:2500]:
-            LAST_SCREEN_IMG.pop(k, None)
-    LAST_SCREEN_IMG[(chat_id, message_id)] = screen_tag
-
-
-async def _cleanup_aux_msgs(bot: Bot, chat_id: int, user_id: int):
-    msg_ids = AUX_MSGS.pop((chat_id, user_id), None)
-    if not msg_ids:
+async def _safe_delete(msg: Message | None):
+    if not msg:
         return
-    for mid in msg_ids:
-        try:
-            await asyncio.wait_for(bot.delete_message(chat_id=chat_id, message_id=mid), timeout=4.0)
-        except Exception:
-            pass
-
-
-def _add_aux_msg(chat_id: int, user_id: int, msg_id: int):
-    if len(AUX_MSGS) > 3000:
-        for k in list(AUX_MSGS.keys())[:1500]:
-            AUX_MSGS.pop(k, None)
-    AUX_MSGS.setdefault((chat_id, user_id), []).append(msg_id)
+    try:
+        await msg.delete(request_timeout=5)
+    except Exception:
+        pass
 
 
 async def _quick_answer(call: CallbackQuery, text: str | None = None, show_alert: bool = False):
     try:
-        await asyncio.wait_for(call.answer(text=text, show_alert=show_alert), timeout=4.0)
+        await call.answer(text=text, show_alert=show_alert, request_timeout=5)
     except Exception:
         pass
 
@@ -1704,14 +1715,12 @@ async def _send_fresh_photo(
     kb: InlineKeyboardMarkup | None
 ):
     cached_fid = PHOTO_CACHE.get(image_name)
-    file_path = os.path.join(IMG_DIR, image_name)
-    media_file = cached_fid or FSInputFile(file_path)
+    media_file = cached_fid or FSInputFile(os.path.join(IMG_DIR, image_name))
 
-    sent = await asyncio.wait_for(
-        msg_target.answer_photo(photo=media_file, caption=caption, reply_markup=kb),
-        timeout=15.0
+    sent = await msg_target.answer_photo(
+        photo=media_file, caption=caption, reply_markup=kb, request_timeout=REQ_TIMEOUT
     )
-    _remember_screen(sent.chat.id, sent.message_id, image_name)
+    _remember_screen(sent.chat.id, sent.message_id, f"photo:{image_name}")
     if not cached_fid and sent.photo:
         fid = sent.photo[-1].file_id
         PHOTO_CACHE[image_name] = fid
@@ -1722,19 +1731,28 @@ async def _send_fresh_photo(
 async def _send_fresh_doc(
     msg_target: Message,
     doc_key: str,
-    doc_caption: str,
+    caption: str,
     kb: InlineKeyboardMarkup | None
 ):
     meta = DOC_META[doc_key]
     cache_key = meta["cache_key"]
     cached_fid = DOC_CACHE.get(cache_key)
-    doc_media = cached_fid or FSInputFile(meta["disk_path"], filename=meta["send_name"])
 
-    sent = await asyncio.wait_for(
-        msg_target.answer_document(document=doc_media, caption=doc_caption, reply_markup=kb),
-        timeout=15.0
-    )
-    _remember_screen(sent.chat.id, sent.message_id, f"{cache_key}")
+    if cached_fid:
+        sent = await msg_target.answer_document(
+            document=cached_fid, caption=caption, reply_markup=kb, request_timeout=REQ_TIMEOUT
+        )
+    else:
+        thumb = FSInputFile(meta["thumb_path"]) if os.path.exists(meta["thumb_path"]) else None
+        sent = await msg_target.answer_document(
+            document=FSInputFile(meta["disk_path"], filename=meta["send_name"]),
+            thumbnail=thumb,
+            caption=caption,
+            reply_markup=kb,
+            request_timeout=REQ_TIMEOUT
+        )
+
+    _remember_screen(sent.chat.id, sent.message_id, cache_key)
     if not cached_fid and sent.document:
         fid = sent.document.file_id
         DOC_CACHE[cache_key] = fid
@@ -1744,61 +1762,67 @@ async def _send_fresh_doc(
 
 async def show_doc_screen(
     target: Message | CallbackQuery,
-    image_name: str,
-    photo_caption: str,
     doc_key: str,
-    doc_caption: str,
-    kb: InlineKeyboardMarkup,
-    screen_tag: str
+    caption: str,
+    kb: InlineKeyboardMarkup
 ):
-    """Показывает баннер с краткой подписью и аккуратный файл документа сразу под ним."""
+    """Единое сообщение: PDF-файл с обложкой-баннером + подпись + кнопки (без разрывов)."""
+    meta = DOC_META[doc_key]
+    cache_key = meta["cache_key"]
+
     if isinstance(target, CallbackQuery):
         asyncio.create_task(_quick_answer(target))
-        uid = target.from_user.id
-        lock = _get_user_lock(uid)
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=4.0)
-        except asyncio.TimeoutError:
+        if _is_duplicate_click(target.from_user.id, target.data):
             return
-        try:
-            msg = target.message
-            if not msg:
-                return
-            chat_id, msg_id = msg.chat.id, msg.message_id
+        msg = target.message
+        if not msg:
+            return
+        chat_id, msg_id = msg.chat.id, msg.message_id
 
-            # Защита от лишней перерисовки при повторном нажатии той же вкладки
-            if LAST_SCREEN_IMG.get((chat_id, msg_id)) == screen_tag:
-                return
-
-            await _cleanup_aux_msgs(target.bot, chat_id, uid)
-            LAST_SCREEN_IMG.pop((chat_id, msg_id), None)
+        # Если уже открыт этот же документ — обновляем только подпись/кнопки
+        if LAST_SCREEN_TAG.get((chat_id, msg_id)) == cache_key and msg.document:
             try:
-                await asyncio.wait_for(msg.delete(), timeout=4.0)
+                await msg.edit_caption(caption=caption, reply_markup=kb, request_timeout=REQ_TIMEOUT)
+                return
+            except TelegramBadRequest as e:
+                if "not modified" in str(e).lower():
+                    return
             except Exception:
                 pass
 
-            banner_msg = await _send_fresh_photo(msg, image_name, photo_caption, None)
-            _add_aux_msg(chat_id, uid, banner_msg.message_id)
+        # Если сообщение уже документ — плавная замена на другой PDF in-place
+        if msg.document:
+            cached_fid = DOC_CACHE.get(cache_key)
+            if cached_fid:
+                media = InputMediaDocument(media=cached_fid, caption=caption, parse_mode=ParseMode.HTML)
+            else:
+                thumb = FSInputFile(meta["thumb_path"]) if os.path.exists(meta["thumb_path"]) else None
+                media = InputMediaDocument(
+                    media=FSInputFile(meta["disk_path"], filename=meta["send_name"]),
+                    thumbnail=thumb,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML
+                )
+            try:
+                edited = await msg.edit_media(media=media, reply_markup=kb, request_timeout=REQ_TIMEOUT)
+                _remember_screen(chat_id, msg_id, cache_key)
+                if not cached_fid and edited and edited.document:
+                    fid = edited.document.file_id
+                    DOC_CACHE[cache_key] = fid
+                    asyncio.create_task(_save_file_id_bg(cache_key, fid))
+                return
+            except TelegramBadRequest as e:
+                if "not modified" in str(e).lower():
+                    return
+            except Exception:
+                pass
 
-            doc_msg = await _send_fresh_doc(msg, doc_key, doc_caption, kb)
-            _remember_screen(doc_msg.chat.id, doc_msg.message_id, screen_tag)
-        finally:
-            lock.release()
+        # Переход с фото на документ: сначала отправляем документ, потом в фоне удаляем старое
+        LAST_SCREEN_TAG.pop((chat_id, msg_id), None)
+        await _send_fresh_doc(msg, doc_key, caption, kb)
+        asyncio.create_task(_safe_delete(msg))
     else:
-        uid = target.from_user.id
-        lock = _get_user_lock(uid)
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=4.0)
-        except asyncio.TimeoutError:
-            return
-        try:
-            banner_msg = await _send_fresh_photo(target, image_name, photo_caption, None)
-            _add_aux_msg(target.chat.id, uid, banner_msg.message_id)
-
-            doc_msg = await _send_fresh_doc(target, doc_key, doc_caption, kb)
-            _remember_screen(doc_msg.chat.id, doc_msg.message_id, screen_tag)
-        finally:
-            lock.release()
+        await _send_fresh_doc(target, doc_key, caption, kb)
 
 
 async def show_screen(
@@ -1808,91 +1832,67 @@ async def show_screen(
     kb: InlineKeyboardMarkup,
     answer_cb: bool = True
 ):
+    tag = f"photo:{image_name}"
+
     if isinstance(target, CallbackQuery):
         if answer_cb:
             asyncio.create_task(_quick_answer(target))
-        uid = target.from_user.id
-        lock = _get_user_lock(uid)
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=4.0)
-        except asyncio.TimeoutError:
+        if _is_duplicate_click(target.from_user.id, target.data):
             return
-        try:
-            msg = target.message
-            if not msg:
-                return
-            chat_id, msg_id = msg.chat.id, msg.message_id
+        msg = target.message
+        if not msg:
+            return
+        chat_id, msg_id = msg.chat.id, msg.message_id
+        has_photo = bool(msg.photo)
 
-            await _cleanup_aux_msgs(target.bot, chat_id, uid)
-
-            has_photo = bool(msg.photo)
-            same_image = (LAST_SCREEN_IMG.get((chat_id, msg_id)) == image_name) and has_photo
-
-            if same_image:
-                try:
-                    await asyncio.wait_for(msg.edit_caption(caption=caption, reply_markup=kb), timeout=12.0)
-                    return
-                except TelegramBadRequest as e:
-                    if "not modified" in str(e).lower():
-                        return
-                except TelegramRetryAfter as e:
-                    await asyncio.sleep(min(e.retry_after, 2.0))
-                    try:
-                        await asyncio.wait_for(msg.edit_caption(caption=caption, reply_markup=kb), timeout=12.0)
-                        return
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-            if has_photo:
-                cached_fid = PHOTO_CACHE.get(image_name)
-                media_file = cached_fid or FSInputFile(os.path.join(IMG_DIR, image_name))
-                try:
-                    edited = await asyncio.wait_for(
-                        msg.edit_media(
-                            media=InputMediaPhoto(media=media_file, caption=caption, parse_mode=ParseMode.HTML),
-                            reply_markup=kb
-                        ),
-                        timeout=15.0
-                    )
-                    _remember_screen(chat_id, msg_id, image_name)
-                    if not cached_fid and edited and edited.photo:
-                        fid = edited.photo[-1].file_id
-                        PHOTO_CACHE[image_name] = fid
-                        asyncio.create_task(_save_file_id_bg(image_name, fid))
-                    return
-                except TelegramBadRequest as e:
-                    if "not modified" in str(e).lower():
-                        return
-                except TelegramRetryAfter as e:
-                    await asyncio.sleep(min(e.retry_after, 2.0))
-                except Exception:
-                    pass
-
-            LAST_SCREEN_IMG.pop((chat_id, msg_id), None)
+        # Быстрый путь: картинка та же -> меняем только подпись и кнопки
+        if has_photo and LAST_SCREEN_TAG.get((chat_id, msg_id)) == tag:
             try:
-                await asyncio.wait_for(msg.delete(), timeout=4.0)
+                await msg.edit_caption(caption=caption, reply_markup=kb, request_timeout=REQ_TIMEOUT)
+                return
+            except TelegramBadRequest as e:
+                if "not modified" in str(e).lower():
+                    return
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(min(e.retry_after, 2.0))
+                try:
+                    await msg.edit_caption(caption=caption, reply_markup=kb, request_timeout=REQ_TIMEOUT)
+                    return
+                except Exception:
+                    pass
             except Exception:
                 pass
+
+        # Замена фото in-place
+        if has_photo:
+            cached_fid = PHOTO_CACHE.get(image_name)
+            media_file = cached_fid or FSInputFile(os.path.join(IMG_DIR, image_name))
             try:
-                await _send_fresh_photo(msg, image_name, caption, kb)
-            except Exception as e:
-                logging.error(f"Ошибка отправки экрана {image_name}: {e}")
-        finally:
-            lock.release()
+                edited = await msg.edit_media(
+                    media=InputMediaPhoto(media=media_file, caption=caption, parse_mode=ParseMode.HTML),
+                    reply_markup=kb,
+                    request_timeout=REQ_TIMEOUT
+                )
+                _remember_screen(chat_id, msg_id, tag)
+                if not cached_fid and edited and edited.photo:
+                    fid = edited.photo[-1].file_id
+                    PHOTO_CACHE[image_name] = fid
+                    asyncio.create_task(_save_file_id_bg(image_name, fid))
+                return
+            except TelegramBadRequest as e:
+                if "not modified" in str(e).lower():
+                    return
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(min(e.retry_after, 2.0))
+            except Exception:
+                pass
+
+        # Переход с документа/текста на фото: отправляем новое, удаляем старое в фоне
+        LAST_SCREEN_TAG.pop((chat_id, msg_id), None)
+        await _send_fresh_photo(msg, image_name, caption, kb)
+        asyncio.create_task(_safe_delete(msg))
     else:
-        uid = target.from_user.id
-        lock = _get_user_lock(uid)
-        try:
-            await asyncio.wait_for(lock.acquire(), timeout=4.0)
-        except asyncio.TimeoutError:
-            return
-        try:
-            AUX_MSGS.pop((target.chat.id, uid), None)
-            await _send_fresh_photo(target, image_name, caption, kb)
-        finally:
-            lock.release()
+        await _send_fresh_photo(target, image_name, caption, kb)
 
 
 async def show_dynamic_photo(
@@ -1902,53 +1902,36 @@ async def show_dynamic_photo(
     caption: str,
     kb: InlineKeyboardMarkup
 ):
-    """Отображает произвольное фото (аватар участника) с безопасным откатом на стандартный баннер."""
-    if not photo_file_id or _plain_len(caption) > 1000:
+    if not photo_file_id:
         await show_screen(call, fallback_image, caption, kb)
         return
 
     asyncio.create_task(_quick_answer(call))
-    uid = call.from_user.id
-    lock = _get_user_lock(uid)
-    try:
-        await asyncio.wait_for(lock.acquire(), timeout=4.0)
-    except asyncio.TimeoutError:
+    msg = call.message
+    if not msg:
         return
-    try:
-        msg = call.message
-        if not msg:
-            return
-        chat_id, msg_id = msg.chat.id, msg.message_id
-        await _cleanup_aux_msgs(call.bot, chat_id, uid)
-        LAST_SCREEN_IMG.pop((chat_id, msg_id), None)
+    chat_id, msg_id = msg.chat.id, msg.message_id
+    LAST_SCREEN_TAG.pop((chat_id, msg_id), None)
 
-        if msg.photo:
-            try:
-                await asyncio.wait_for(
-                    msg.edit_media(
-                        media=InputMediaPhoto(media=photo_file_id, caption=caption, parse_mode=ParseMode.HTML),
-                        reply_markup=kb
-                    ),
-                    timeout=12.0
-                )
-                return
-            except TelegramBadRequest as e:
-                if "not modified" in str(e).lower():
-                    return
-            except Exception:
-                pass
-
+    if msg.photo:
         try:
-            await asyncio.wait_for(msg.delete(), timeout=4.0)
+            await msg.edit_media(
+                media=InputMediaPhoto(media=photo_file_id, caption=caption, parse_mode=ParseMode.HTML),
+                reply_markup=kb,
+                request_timeout=REQ_TIMEOUT
+            )
+            return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e).lower():
+                return
         except Exception:
             pass
-        try:
-            await asyncio.wait_for(msg.answer_photo(photo=photo_file_id, caption=caption, reply_markup=kb), timeout=12.0)
-            return
-        except Exception:
-            await _send_fresh_photo(msg, fallback_image, caption, kb)
-    finally:
-        lock.release()
+
+    try:
+        await msg.answer_photo(photo=photo_file_id, caption=caption, reply_markup=kb, request_timeout=REQ_TIMEOUT)
+    except Exception:
+        await _send_fresh_photo(msg, fallback_image, caption, kb)
+    asyncio.create_task(_safe_delete(msg))
 
 
 # ================= КЛАВИАТУРЫ =================
@@ -2051,35 +2034,32 @@ BACK_XBOX_KB = InlineKeyboardMarkup(inline_keyboard=[
 ])
 
 
-# ================= ТЕКСТЫ ВИТРИНЫ И ПОДПИСИ ДОКУМЕНТОВ =================
+# ================= ТЕКСТЫ ВИТРИНЫ И ДОКУМЕНТОВ =================
 SAFE_SUPPORT_USER = html.escape(SUPPORT_USERNAME)
 
 GATE_TEXT = (
-    "🛡 <b>Добро пожаловать в Bombych Store!</b>\n"
+    "💜 <b>Bombych Store</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "Перед первым входом необходимо ознакомиться и принять наши официальные документы:\n\n"
-    "<blockquote>📄 <b>Пользовательское соглашение</b> — правила оформления, оплаты, выдачи и возврата заказов.\n"
-    "🔒 <b>Политика конфиденциальности</b> — порядок сбора, защиты и нераспространения ваших личных данных.</blockquote>\n"
-    "Нажмите <b>«✅ Принимаю условия»</b> для входа в магазин (повторно подтверждать не потребуется)."
+    "<blockquote>Чтобы начать пользоваться магазином, подтвердите согласие с "
+    "<b>Пользовательским соглашением</b> и <b>Политикой конфиденциальности</b>.</blockquote>\n"
+    "👇 Вы можете открыть файлы документов ниже или сразу перейти в магазин:"
 )
 
-TERMS_PHOTO_CAPTION = (
+TERMS_DOC_CAPTION = (
     "📄 <b>Пользовательское соглашение • Bombych Store</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "<blockquote>В документе подробно описаны правила работы магазина, порядок оплаты и выдачи заказов (05:00–22:00 МСК), "
+    "<blockquote>Правила оформления, оплаты и выдачи заказов (05:00–22:00 МСК), "
     "условия возврата цифровых товаров и ответственность сторон.</blockquote>\n"
-    "👇 <b>Полный документ прикреплён файлом ниже.</b>"
+    "👆 <b>Нажмите на файл выше, чтобы открыть полный документ.</b>"
 )
 
-PRIVACY_PHOTO_CAPTION = (
+PRIVACY_DOC_CAPTION = (
     "🔒 <b>Политика конфиденциальности • Bombych Store</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "<blockquote>В документе указано, какие данные собирает бот, как они защищаются, "
-    "почему не передаются третьим лицам и как запросить их удаление.</blockquote>\n"
-    "👇 <b>Полный документ прикреплён файлом ниже.</b>"
+    "<blockquote>Порядок сбора, хранения и защиты данных, запрет на передачу третьим лицам "
+    "и правила удаления вашего профиля.</blockquote>\n"
+    "👆 <b>Нажмите на файл выше, чтобы открыть полный документ.</b>"
 )
-
-DOC_FILE_CAPTION = "📎 <b>Откройте файл, чтобы прочитать полный текст документа.</b>"
 
 HOME_TEXT = (
     "💜 <b>Bombych Store • Магазин игрового доната</b>\n"
@@ -2157,17 +2137,8 @@ XBOX_TEXT = (
 )
 
 
-# ================= ЗАЩИТА ПЕРВОГО ВХОДА (ОДНОКРАТНОЕ СОГЛАСИЕ) =================
+# ================= ОДНОКРАТНОЕ СОГЛАСИЕ ПРИ ПЕРВОМ ВХОДЕ =================
 async def send_consent_gate(message: Message):
-    uid = message.from_user.id
-    try:
-        rm_msg = await asyncio.wait_for(
-            message.answer("👋 <b>Добро пожаловать в Bombych Store!</b>", reply_markup=ReplyKeyboardRemove()),
-            timeout=10.0
-        )
-        _add_aux_msg(message.chat.id, uid, rm_msg.message_id)
-    except Exception:
-        pass
     await _send_fresh_photo(message, "main.jpg", GATE_TEXT, GATE_KB)
 
 
@@ -2195,7 +2166,7 @@ class TermsGateMiddleware(BaseMiddleware):
                 return await handler(event, data)
             await _quick_answer(
                 event,
-                "Сначала ознакомьтесь и примите Пользовательское соглашение и Политику конфиденциальности.",
+                "Сначала подтвердите согласие с Пользовательским соглашением и Политикой конфиденциальности.",
                 show_alert=True
             )
             await show_screen(event, "main.jpg", GATE_TEXT, GATE_KB, answer_cb=False)
@@ -2210,18 +2181,12 @@ router.callback_query.middleware(TermsGateMiddleware())
 
 @router.callback_query(F.data == "gate_terms")
 async def cb_gate_terms(call: CallbackQuery):
-    await show_doc_screen(
-        call, "terms.jpg", TERMS_PHOTO_CAPTION,
-        "terms", DOC_FILE_CAPTION, GATE_DOC_KB, "gate_doc:terms"
-    )
+    await show_doc_screen(call, "terms", TERMS_DOC_CAPTION, GATE_DOC_KB)
 
 
 @router.callback_query(F.data == "gate_privacy")
 async def cb_gate_privacy(call: CallbackQuery):
-    await show_doc_screen(
-        call, "privacy.jpg", PRIVACY_PHOTO_CAPTION,
-        "privacy", DOC_FILE_CAPTION, GATE_DOC_KB, "gate_doc:privacy"
-    )
+    await show_doc_screen(call, "privacy", PRIVACY_DOC_CAPTION, GATE_DOC_KB)
 
 
 @router.callback_query(F.data == "gate_back")
@@ -2231,81 +2196,59 @@ async def cb_gate_back(call: CallbackQuery):
 
 @router.callback_query(F.data == "legal_accept")
 async def cb_legal_accept(call: CallbackQuery, state: FSMContext):
+    if _is_duplicate_click(call.from_user.id, call.data):
+        return await _quick_answer(call)
+    asyncio.create_task(_quick_answer(call, "✅ Условия приняты!"))
     if await state.get_state():
         await state.clear()
-    await _quick_answer(call, "✅ Условия приняты! Добро пожаловать в Bombych Store!")
     await set_user_accepted(call.from_user, True)
 
-    uid = call.from_user.id
-    lock = _get_user_lock(uid)
-    try:
-        await asyncio.wait_for(lock.acquire(), timeout=4.0)
-    except asyncio.TimeoutError:
+    msg = call.message
+    if not msg:
         return
-    try:
-        msg = call.message
-        if msg:
-            await _cleanup_aux_msgs(call.bot, msg.chat.id, uid)
-            LAST_SCREEN_IMG.pop((msg.chat.id, msg.message_id), None)
-            try:
-                await asyncio.wait_for(msg.delete(), timeout=4.0)
-            except Exception:
-                pass
-            await asyncio.wait_for(
-                msg.answer(
-                    "💜 <b>Добро пожаловать в официальный магазин Bombych Store!</b>",
-                    reply_markup=reply_main_kb(uid)
-                ),
-                timeout=10.0
-            )
-            kb = HOME_KB_ADMIN if uid == ADMIN_ID else HOME_KB_USER
-            await _send_fresh_photo(msg, "main.jpg", HOME_TEXT, kb)
-    finally:
-        lock.release()
+    uid = call.from_user.id
+    LAST_SCREEN_TAG.pop((msg.chat.id, msg.message_id), None)
+
+    await msg.answer(
+        "💜 <b>Добро пожаловать в официальный магазин Bombych Store!</b>",
+        reply_markup=reply_main_kb(uid),
+        request_timeout=REQ_TIMEOUT
+    )
+    kb = HOME_KB_ADMIN if uid == ADMIN_ID else HOME_KB_USER
+    await _send_fresh_photo(msg, "main.jpg", HOME_TEXT, kb)
+    asyncio.create_task(_safe_delete(msg))
 
 
 @router.callback_query(F.data == "legal_decline")
 async def cb_legal_decline(call: CallbackQuery, state: FSMContext):
-    if await state.get_state():
-        await state.clear()
+    if _is_duplicate_click(call.from_user.id, call.data):
+        return await _quick_answer(call)
     await _quick_answer(
         call,
-        "Вы отказались от условий. Использование бота невозможно без принятия Соглашения и Политики конфиденциальности.",
+        "Без принятия условий использование магазина невозможно.",
         show_alert=True
     )
+    if await state.get_state():
+        await state.clear()
     await set_user_accepted(call.from_user, False)
 
-    uid = call.from_user.id
-    lock = _get_user_lock(uid)
-    try:
-        await asyncio.wait_for(lock.acquire(), timeout=4.0)
-    except asyncio.TimeoutError:
+    msg = call.message
+    if not msg:
         return
-    try:
-        msg = call.message
-        if msg:
-            await _cleanup_aux_msgs(call.bot, msg.chat.id, uid)
-            LAST_SCREEN_IMG.pop((msg.chat.id, msg.message_id), None)
-            try:
-                await asyncio.wait_for(msg.delete(), timeout=4.0)
-            except Exception:
-                pass
-            await asyncio.wait_for(
-                msg.answer(
-                    "🚪 <b>Вы вышли из бота Bombych Store.</b>\n\n"
-                    "Для использования магазина необходимо принять Пользовательское соглашение и Политику конфиденциальности.\n\n"
-                    "Если передумаете — просто нажмите /start.",
-                    reply_markup=ReplyKeyboardRemove()
-                ),
-                timeout=10.0
-            )
-    finally:
-        lock.release()
+    LAST_SCREEN_TAG.pop((msg.chat.id, msg.message_id), None)
+    await msg.answer(
+        "🚪 <b>Вы вышли из Bombych Store.</b>\n\n"
+        "Для работы с магазином необходимо принять Пользовательское соглашение и Политику конфиденциальности.\n\n"
+        "Чтобы вернуться — нажмите /start.",
+        reply_markup=ReplyKeyboardRemove(),
+        request_timeout=REQ_TIMEOUT
+    )
+    asyncio.create_task(_safe_delete(msg))
 
 
 @router.message(Command("reset_terms"))
 async def cmd_reset_terms(message: Message, state: FSMContext):
-    """Служебная команда только для админа, чтобы повторно проверить экран первого входа."""
+    """Служебная команда только для админа, чтобы повторно проверить окно первого входа."""
     if message.from_user.id != ADMIN_ID:
         return
     if await state.get_state():
@@ -2321,18 +2264,16 @@ async def cmd_start(message: Message, state: FSMContext):
         await state.clear()
     await register_user(message.from_user, force_update=True)
 
-    # Показываем окно согласия ТОЛЬКО если пользователь ещё ни разу не принимал условия
+    # Показываем согласие ТОЛЬКО один раз при самом первом входе
     if message.from_user.id not in ACCEPTED_USERS:
         await send_consent_gate(message)
         return
 
     kb = HOME_KB_ADMIN if message.from_user.id == ADMIN_ID else HOME_KB_USER
-    await asyncio.wait_for(
-        message.answer(
-            "💜 <b>Добро пожаловать в официальный магазин Bombych Store!</b>",
-            reply_markup=reply_main_kb(message.from_user.id)
-        ),
-        timeout=10.0
+    await message.answer(
+        "💜 <b>Добро пожаловать в официальный магазин Bombych Store!</b>",
+        reply_markup=reply_main_kb(message.from_user.id),
+        request_timeout=REQ_TIMEOUT
     )
     await show_screen(message, "main.jpg", HOME_TEXT, kb)
 
@@ -2401,40 +2342,28 @@ async def cb_rules(call: CallbackQuery, state: FSMContext):
 async def msg_terms(message: Message, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await show_doc_screen(
-        message, "terms.jpg", TERMS_PHOTO_CAPTION,
-        "terms", DOC_FILE_CAPTION, LEGAL_KB, "nav_doc:terms"
-    )
+    await show_doc_screen(message, "terms", TERMS_DOC_CAPTION, LEGAL_KB)
 
 
 @router.callback_query(F.data == "nav_terms")
 async def cb_terms(call: CallbackQuery, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await show_doc_screen(
-        call, "terms.jpg", TERMS_PHOTO_CAPTION,
-        "terms", DOC_FILE_CAPTION, LEGAL_KB, "nav_doc:terms"
-    )
+    await show_doc_screen(call, "terms", TERMS_DOC_CAPTION, LEGAL_KB)
 
 
 @router.message(Command("privacy"))
 async def msg_privacy(message: Message, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await show_doc_screen(
-        message, "privacy.jpg", PRIVACY_PHOTO_CAPTION,
-        "privacy", DOC_FILE_CAPTION, LEGAL_KB, "nav_doc:privacy"
-    )
+    await show_doc_screen(message, "privacy", PRIVACY_DOC_CAPTION, LEGAL_KB)
 
 
 @router.callback_query(F.data == "nav_privacy")
 async def cb_privacy(call: CallbackQuery, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    await show_doc_screen(
-        call, "privacy.jpg", PRIVACY_PHOTO_CAPTION,
-        "privacy", DOC_FILE_CAPTION, LEGAL_KB, "nav_doc:privacy"
-    )
+    await show_doc_screen(call, "privacy", PRIVACY_DOC_CAPTION, LEGAL_KB)
 
 
 @router.message(Command("xbox"))
@@ -2630,6 +2559,8 @@ async def cb_sbp_soon(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("pay_da_") | F.data.startswith("pay_crypto_"))
 async def cb_pay(call: CallbackQuery, state: FSMContext):
+    if _is_duplicate_click(call.from_user.id, call.data):
+        return await _quick_answer(call)
     parts = call.data.split("_")
     try:
         method, pid = parts[1], int(parts[2])
@@ -2710,13 +2641,11 @@ async def cb_sendcheck(call: CallbackQuery, state: FSMContext):
             InlineKeyboardButton(text="❌ Отмена", callback_data="nav_home")
         ]
     ])
-    await asyncio.wait_for(
-        call.message.answer(
-            f"📸 <b>Прикрепите скриншот или файл чека по заказу #{order_id} в этот чат.</b>\n"
-            "<i>В подписи к файлу вы можете сразу указать игровой ID, UID, тег или почту для быстрого выполнения заказа.</i>",
-            reply_markup=kb
-        ),
-        timeout=10.0
+    await call.message.answer(
+        f"📸 <b>Прикрепите скриншот или файл чека по заказу #{order_id} в этот чат.</b>\n"
+        "<i>В подписи к файлу вы можете сразу указать игровой ID, UID, тег или почту для быстрого выполнения заказа.</i>",
+        reply_markup=kb,
+        request_timeout=REQ_TIMEOUT
     )
 
 
@@ -2752,14 +2681,14 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
 
     try:
         if message.photo:
-            await asyncio.wait_for(
-                bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=adm_caption, reply_markup=adm_kb),
-                timeout=12.0
+            await bot.send_photo(
+                chat_id=ADMIN_ID, photo=message.photo[-1].file_id,
+                caption=adm_caption, reply_markup=adm_kb, request_timeout=REQ_TIMEOUT
             )
         else:
-            await asyncio.wait_for(
-                bot.send_document(chat_id=ADMIN_ID, document=message.document.file_id, caption=adm_caption, reply_markup=adm_kb),
-                timeout=12.0
+            await bot.send_document(
+                chat_id=ADMIN_ID, document=message.document.file_id,
+                caption=adm_caption, reply_markup=adm_kb, request_timeout=REQ_TIMEOUT
             )
     except Exception as e:
         logging.error(f"Не удалось переслать чек #{order_id} администратору: {e}")
@@ -2770,13 +2699,11 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
             InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav_home")
         ]
     ])
-    await asyncio.wait_for(
-        message.answer(
-            f"✅ <b>Чек по заказу #{order_id} отправлен на проверку!</b>\n"
-            "Уведомление о выполнении заказа придет в этот чат.",
-            reply_markup=kb
-        ),
-        timeout=10.0
+    await message.answer(
+        f"✅ <b>Чек по заказу #{order_id} отправлен на проверку!</b>\n"
+        "Уведомление о выполнении заказа придет в этот чат.",
+        reply_markup=kb,
+        request_timeout=REQ_TIMEOUT
     )
 
 
@@ -2785,9 +2712,10 @@ async def wrong_receipt(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отменить отправку чека", callback_data="nav_home")]
     ])
-    await asyncio.wait_for(
-        message.answer("⚠️ Пожалуйста, отправьте <b>скриншот, фотографию или файл</b> чека.", reply_markup=kb),
-        timeout=10.0
+    await message.answer(
+        "⚠️ Пожалуйста, отправьте <b>скриншот, фотографию или файл</b> чека.",
+        reply_markup=kb,
+        request_timeout=REQ_TIMEOUT
     )
 
 
@@ -2804,24 +2732,22 @@ async def cb_adm_ok(call: CallbackQuery, bot: Bot):
         await DB_CONN.commit()
 
     try:
-        await asyncio.wait_for(
-            bot.send_message(
-                chat_id=uid,
-                text=(
-                    f"🎉 <b>Оплата по заказу #{oid} подтверждена!</b>\n"
-                    "Ваш заказ принят к выдаче. При необходимости уточнения данных администратор свяжется с вами в ЛС.\n"
-                    "💜 Спасибо за покупку в <b>Bombych Store</b>!"
-                )
+        await bot.send_message(
+            chat_id=uid,
+            text=(
+                f"🎉 <b>Оплата по заказу #{oid} подтверждена!</b>\n"
+                "Ваш заказ принят к выдаче. При необходимости уточнения данных администратор свяжется с вами в ЛС.\n"
+                "💜 Спасибо за покупку в <b>Bombych Store</b>!"
             ),
-            timeout=10.0
+            request_timeout=REQ_TIMEOUT
         )
     except Exception as e:
         logging.warning(f"Не удалось уведомить клиента {uid} о заказе #{oid}: {e}")
 
     try:
-        await asyncio.wait_for(
-            call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ <b>ВЫПОЛНЕНО</b>"),
-            timeout=10.0
+        await call.message.edit_caption(
+            caption=(call.message.caption or "") + "\n\n✅ <b>ВЫПОЛНЕНО</b>",
+            request_timeout=REQ_TIMEOUT
         )
     except Exception:
         pass
@@ -2840,20 +2766,18 @@ async def cb_adm_no(call: CallbackQuery, bot: Bot):
         await DB_CONN.commit()
 
     try:
-        await asyncio.wait_for(
-            bot.send_message(
-                chat_id=uid,
-                text=f"❌ <b>Заказ #{oid} отклонен.</b>\nОплата не найдена. Проверьте чек или напишите нам в поддержку ({SAFE_SUPPORT_USER})."
-            ),
-            timeout=10.0
+        await bot.send_message(
+            chat_id=uid,
+            text=f"❌ <b>Заказ #{oid} отклонен.</b>\nОплата не найдена. Проверьте чек или напишите нам в поддержку ({SAFE_SUPPORT_USER}).",
+            request_timeout=REQ_TIMEOUT
         )
     except Exception as e:
         logging.warning(f"Не удалось уведомить клиента {uid} об отказе #{oid}: {e}")
 
     try:
-        await asyncio.wait_for(
-            call.message.edit_caption(caption=(call.message.caption or "") + "\n\n❌ <b>ОТКЛОНЕНО</b>"),
-            timeout=10.0
+        await call.message.edit_caption(
+            caption=(call.message.caption or "") + "\n\n❌ <b>ОТКЛОНЕНО</b>",
+            request_timeout=REQ_TIMEOUT
         )
     except Exception:
         pass
@@ -3011,7 +2935,7 @@ async def cb_adm_user_card(call: CallbackQuery, state: FSMContext, bot: Bot):
     done_orders = done_orders or 0
 
     try:
-        chat = await asyncio.wait_for(bot.get_chat(uid), timeout=4.0)
+        chat = await bot.get_chat(uid, request_timeout=5)
         fresh_uname = chat.username or ""
         fresh_fname = chat.first_name or fname or "Гость"
         if fresh_uname != (uname or "") or fresh_fname != (fname or ""):
@@ -3027,7 +2951,7 @@ async def cb_adm_user_card(call: CallbackQuery, state: FSMContext, bot: Bot):
 
     avatar_fid = None
     try:
-        photos = await asyncio.wait_for(bot.get_user_profile_photos(user_id=uid, limit=1), timeout=4.0)
+        photos = await bot.get_user_profile_photos(user_id=uid, limit=1, request_timeout=5)
         if photos.total_count > 0 and photos.photos:
             avatar_fid = photos.photos[0][-1].file_id
     except Exception:
@@ -3072,9 +2996,10 @@ async def cb_adm_add_item(call: CallbackQuery):
         b.button(text=label, callback_data=f"admcat_{cid}")
     b.adjust(2)
     b.row(InlineKeyboardButton(text="⬅️ Отмена", callback_data="nav_admin"))
-    await asyncio.wait_for(
-        call.message.answer("📂 <b>Выберите категорию для нового товара:</b>", reply_markup=b.as_markup()),
-        timeout=10.0
+    await call.message.answer(
+        "📂 <b>Выберите категорию для нового товара:</b>",
+        reply_markup=b.as_markup(),
+        request_timeout=REQ_TIMEOUT
     )
 
 
@@ -3086,9 +3011,9 @@ async def cb_adm_pick_cat(call: CallbackQuery, state: FSMContext):
     cid = int(call.data.split("_")[1])
     await state.update_data(cid=cid)
     await state.set_state(AdminFlow.add_full_name)
-    await asyncio.wait_for(
-        call.message.answer("✏️ Введите <b>полное название товара</b> (например: <code>4500 В-Баксов</code>):"),
-        timeout=10.0
+    await call.message.answer(
+        "✏️ Введите <b>полное название товара</b> (например: <code>4500 В-Баксов</code>):",
+        request_timeout=REQ_TIMEOUT
     )
 
 
@@ -3096,9 +3021,9 @@ async def cb_adm_pick_cat(call: CallbackQuery, state: FSMContext):
 async def adm_set_fname(message: Message, state: FSMContext):
     await state.update_data(fname=(message.text or "").strip())
     await state.set_state(AdminFlow.add_short_btn)
-    await asyncio.wait_for(
-        message.answer("🔘 Введите <b>короткое название для кнопки</b> до 10 символов (например: <code>💎 4500 ВБ</code>):"),
-        timeout=10.0
+    await message.answer(
+        "🔘 Введите <b>короткое название для кнопки</b> до 10 символов (например: <code>💎 4500 ВБ</code>):",
+        request_timeout=REQ_TIMEOUT
     )
 
 
@@ -3106,9 +3031,9 @@ async def adm_set_fname(message: Message, state: FSMContext):
 async def adm_set_sbtn(message: Message, state: FSMContext):
     await state.update_data(sbtn=(message.text or "").strip())
     await state.set_state(AdminFlow.add_price)
-    await asyncio.wait_for(
-        message.answer("💰 Введите <b>цену в рублях</b> (бот сам сделает скидку -20%, либо введите две цены через пробел: <code>старая новая</code>):"),
-        timeout=10.0
+    await message.answer(
+        "💰 Введите <b>цену в рублях</b> (бот сам сделает скидку -20%, либо введите две цены через пробел: <code>старая новая</code>):",
+        request_timeout=REQ_TIMEOUT
     )
 
 
@@ -3122,9 +3047,9 @@ async def adm_save_product(message: Message, state: FSMContext):
             old_p = int(float(parts[0]))
             new_p = max(10, int(round(old_p * 0.80)))
     except (ValueError, IndexError):
-        return await asyncio.wait_for(
-            message.answer("⚠️ Введите число (например <code>500</code> или <code>500 400</code>):"),
-            timeout=10.0
+        return await message.answer(
+            "⚠️ Введите число (например <code>500</code> или <code>500 400</code>):",
+            request_timeout=REQ_TIMEOUT
         )
 
     data = await state.get_data()
@@ -3140,12 +3065,10 @@ async def adm_save_product(message: Message, state: FSMContext):
         await DB_CONN.commit()
     await reload_catalog_cache()
 
-    await asyncio.wait_for(
-        message.answer(
-            f"✅ Товар <b>{html.escape(data['fname'])}</b> добавлен!\n"
-            f"Цена: <s>{old_p}₽</s> → <b>{new_p}₽</b> (Кнопка: <code>{html.escape(btn_lbl)}</code>)"
-        ),
-        timeout=10.0
+    await message.answer(
+        f"✅ Товар <b>{html.escape(data['fname'])}</b> добавлен!\n"
+        f"Цена: <s>{old_p}₽</s> → <b>{new_p}₽</b> (Кнопка: <code>{html.escape(btn_lbl)}</code>)",
+        request_timeout=REQ_TIMEOUT
     )
 
 
@@ -3156,9 +3079,10 @@ async def cb_broadcast(call: CallbackQuery, state: FSMContext):
     asyncio.create_task(_quick_answer(call))
     await state.set_state(AdminFlow.waiting_broadcast)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="nav_admin")]])
-    await asyncio.wait_for(
-        call.message.answer("📢 Введите текст рассылки для всех клиентов:", reply_markup=kb),
-        timeout=10.0
+    await call.message.answer(
+        "📢 Введите текст рассылки для всех клиентов:",
+        reply_markup=kb,
+        request_timeout=REQ_TIMEOUT
     )
 
 
@@ -3172,26 +3096,20 @@ async def run_broadcast(message: Message, state: FSMContext, bot: Bot):
     sent = 0
     for (uid,) in users:
         try:
-            await asyncio.wait_for(
-                bot.send_message(uid, f"📢 <b>Новости • Bombych Store</b>\n\n{safe_text}"),
-                timeout=8.0
-            )
+            await bot.send_message(uid, f"📢 <b>Новости • Bombych Store</b>\n\n{safe_text}", request_timeout=8)
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
             pass
-    await asyncio.wait_for(
-        message.answer(f"✅ Рассылка доставлена <b>{sent}</b> клиентам."),
-        timeout=10.0
-    )
+    await message.answer(f"✅ Рассылка доставлена <b>{sent}</b> клиентам.", request_timeout=REQ_TIMEOUT)
 
 
 # ================= ГЛОБАЛЬНЫЙ ПЕРЕХВАТЧИК ОШИБОК =================
 @router.error()
 async def global_error_handler(event: ErrorEvent):
-    logging.exception(f"Необработанная ошибка в апдейте: {event.exception}")
+    logging.exception(f"Ошибка в апдейте: {event.exception}")
     if event.update.callback_query:
-        await _quick_answer(event.update.callback_query, "⚠️ Временная ошибка, нажмите кнопку ещё раз.")
+        await _quick_answer(event.update.callback_query, "⚠️ Временный сбой, нажмите кнопку ещё раз.")
 
 
 # ================= МЕНЮ «☰» И ЗАПУСК =================
@@ -3217,19 +3135,23 @@ async def main():
     prepare_all_banners()
     await init_db_and_cache()
 
-    session = AiohttpSession(timeout=60)
+    session = AiohttpSession(timeout=25)
+    # Короткий keepalive защищает от зависших NAT-соединений на Docker-хостинге
+    if hasattr(session, "_connector_init") and isinstance(session._connector_init, dict):
+        session._connector_init["keepalive_timeout"] = 10
+
     bot = Bot(token=BOT_TOKEN, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await setup_menu_commands(bot)
 
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Bombych Store v15 успешно запущен!")
+    logging.info("Bombych Store v16 успешно запущен!")
     try:
         await dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),
-            polling_timeout=20
+            polling_timeout=10
         )
     finally:
         await bot.session.close()
