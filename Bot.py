@@ -12,6 +12,7 @@ import subprocess
 import sys
 import urllib.request
 from datetime import datetime
+from typing import Any, Awaitable, Callable, Dict
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops
@@ -20,7 +21,7 @@ except ImportError:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops
 
 import aiosqlite
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
@@ -30,9 +31,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, CallbackQuery, ErrorEvent, FSInputFile, InputMediaPhoto,
-    ReplyKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    BotCommand, BotCommandScopeDefault
+    BotCommand, BotCommandScopeDefault, TelegramObject
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -41,7 +42,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or ""
 ADMIN_ID = 5157852376
 
-# ТВОЙ ЛИЧНЫЙ КОНТАКТ В TELEGRAM (укажи свой актуальный @username)
+# КОНТАКТ ПОДДЕРЖКИ В TELEGRAM (укажи актуальный @username)
 SUPPORT_USERNAME = "@bombych"
 SUPPORT_LINK = f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}"
 DONATIONALERTS_URL = "https://www.donationalerts.com/r/bombychyt"
@@ -52,7 +53,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 CURRENT_DB_NAME = "bombystore_v10.db"
 DB_PATH = os.path.join(DATA_DIR, CURRENT_DB_NAME)
-IMG_DIR = os.path.join(BASE_DIR, "assets_v13")
+IMG_DIR = os.path.join(BASE_DIR, "assets_v14")
 CATALOG_SCHEMA_VERSION = "v12_fortnite_folder"
 
 FORTNITE_CAT_IDS = (1, 2, 3)
@@ -80,10 +81,12 @@ DB_CONN: aiosqlite.Connection | None = None
 DB_LOCK = asyncio.Lock()
 USER_LOCKS: dict[int, asyncio.Lock] = {}
 LAST_SCREEN_IMG: dict[tuple[int, int], str] = {}
+AUX_MSGS: dict[tuple[int, int], list[int]] = {}
 
 PHOTO_CACHE: dict[str, str] = {}
 FILE_HASHES: dict[str, str] = {}
 KNOWN_USERS: set[int] = set()
+ACCEPTED_USERS: set[int] = set()
 _RESOLVED_FONT_PATH: str | None = None
 _FONT_SEARCHED = False
 
@@ -368,14 +371,14 @@ SERVICE_BANNERS = [
     ("rules.jpg", "purple_forest", ("ПРАВИЛА", "")),
     ("xbox.jpg", "cyan_night", ("ПРИВЯЗКА", "")),
     ("support.jpg", "blue_royal", ("ПОДДЕРЖКА", "")),
-    ("terms.jpg", "violet_neon", ("СОГЛАШЕНИЕ", "")),
-    ("privacy.jpg", "cyan_night", ("ПОЛИТИКА", "ДАННЫХ")),
+    ("terms.jpg", "violet_neon", ("ПОЛЬЗОВАТЕЛЬСКОЕ", "СОГЛАШЕНИЕ")),
+    ("privacy.jpg", "cyan_night", ("ПОЛИТИКА", "КОНФИДЕНЦИАЛЬНОСТИ")),
 ]
 
 
 # ================= АВТООЧИСТКА СТАРЫХ ПАПОК И БД =================
 def cleanup_old_files():
-    """Удаляет только устаревшие папки (assets_v*, img_v* кроме текущей) и старые БД. Папку img/ НЕ трогает."""
+    """Удаляет устаревшие папки (assets_v*, img_v* кроме текущей) и старые БД. Папку img/ НЕ трогает."""
     removed_items = []
     current_img_folder = os.path.basename(IMG_DIR)
 
@@ -666,6 +669,19 @@ def _load_bold_font(size: int):
         return ImageFont.load_default()
 
 
+def _fit_font(draw: ImageDraw.ImageDraw, text: str, max_w: int, start_size: int, min_size: int = 34):
+    """Автоматически подбирает размер шрифта, чтобы текст всегда помещался на баннер с отступами."""
+    sz = start_size
+    while sz >= min_size:
+        f = _load_bold_font(sz)
+        bbox = draw.textbbox((0, 0), text, font=f)
+        if (bbox[2] - bbox[0]) <= max_w:
+            return f, bbox
+        sz -= 4
+    f = _load_bold_font(min_size)
+    return f, draw.textbbox((0, 0), text, font=f)
+
+
 def _make_fallback_logo() -> Image.Image:
     sz = 360
     im = Image.new("RGBA", (sz, sz), (16, 6, 36, 255))
@@ -792,19 +808,22 @@ def _render_chisel_3d_text(canvas: Image.Image, line1: str, line2: str, pal: dic
     w, h = canvas.size
     text_mask = Image.new("L", (w, h), 0)
     mdraw = ImageDraw.Draw(text_mask)
+    max_text_w = w - 90
 
     if line2:
-        f1 = _load_bold_font(104 if len(line1) <= 9 else 84)
-        f2 = _load_bold_font(86 if len(line2) <= 10 else 68)
-        b1, b2 = mdraw.textbbox((0, 0), line1, font=f1), mdraw.textbbox((0, 0), line2, font=f2)
+        f1, b1 = _fit_font(mdraw, line1, max_text_w, 104 if len(line1) <= 9 else 84)
+        f2, b2 = _fit_font(mdraw, line2, max_text_w, 86 if len(line2) <= 10 else 72)
         w1, h1, w2, h2 = b1[2] - b1[0], b1[3] - b1[1], b2[2] - b2[0], b2[3] - b2[1]
-        x1, y1 = (w - w1) // 2 - b1[0], (h - (h1 + h2 + 16)) // 2 - b1[1] - 4
-        x2, y2 = (w - w2) // 2 - b2[0], y1 + b1[1] + h1 + 16 - b2[1]
+        gap = 18
+        x1 = (w - w1) // 2 - b1[0]
+        y1 = (h - (h1 + h2 + gap)) // 2 - b1[1] - 4
+        x2 = (w - w2) // 2 - b2[0]
+        y2 = y1 + b1[1] + h1 + gap - b2[1]
         mdraw.text((x1, y1), line1, font=f1, fill=255)
         mdraw.text((x2, y2), line2, font=f2, fill=255)
     else:
-        f1 = _load_bold_font(146 if len(line1) <= 7 else (112 if len(line1) <= 10 else 86))
-        b1 = mdraw.textbbox((0, 0), line1, font=f1)
+        start_sz = 146 if len(line1) <= 7 else (112 if len(line1) <= 10 else 92)
+        f1, b1 = _fit_font(mdraw, line1, max_text_w, start_sz)
         w1, h1 = b1[2] - b1[0], b1[3] - b1[1]
         mdraw.text(((w - w1) // 2 - b1[0], (h - h1) // 2 - b1[1] - 4), line1, font=f1, fill=255)
 
@@ -909,9 +928,10 @@ def generate_scenic_banner(filepath: str, logo_img: Image.Image, theme: str, lin
 
 
 def _compute_assets_stamp() -> str:
-    """Хэш состава папки img/ и шрифта — перегенерируем баннеры только при изменениях."""
     h = hashlib.md5()
     h.update((_resolve_font_path() or "default").encode("utf-8"))
+    for img_name, theme, (t1, t2) in SERVICE_BANNERS:
+        h.update(f"{img_name}:{theme}:{t1}:{t2}".encode("utf-8"))
     for d in (os.path.join(BASE_DIR, "img"), os.path.join(BASE_DIR, "images")):
         if os.path.isdir(d):
             for fname in sorted(os.listdir(d)):
@@ -946,7 +966,6 @@ def prepare_all_banners():
         lp = _find_user_file(USER_UPLOADED_MAP["logo.jpg"])
         logo_img = Image.open(lp).convert("RGBA") if lp else _make_fallback_logo()
 
-        # 1. Подключаем оригинальные картинки пользователя из папки img/
         for target, candidates in USER_UPLOADED_MAP.items():
             if target != "logo.jpg":
                 dest = os.path.join(IMG_DIR, target)
@@ -954,7 +973,6 @@ def prepare_all_banners():
                 if found:
                     Image.open(found).convert("RGB").save(dest, "JPEG", quality=86, optimize=True)
 
-        # 2. Категории: берём готовый файл из img/, иначе генерируем сцену
         for _, _, _, img_name, theme, (t1, t2), _, _ in CATEGORIES_DATA:
             dest = os.path.join(IMG_DIR, img_name)
             found = _find_user_file([img_name, img_name.replace(".jpg", ".png")])
@@ -963,7 +981,6 @@ def prepare_all_banners():
             elif not os.path.exists(dest) or target_not_uploaded(img_name):
                 generate_scenic_banner(dest, logo_img, theme, t1, t2)
 
-        # 3. Сервисные баннеры
         for img_name, theme, (t1, t2) in SERVICE_BANNERS:
             dest = os.path.join(IMG_DIR, img_name)
             found = _find_user_file([img_name, img_name.replace(".jpg", ".png")])
@@ -997,9 +1014,16 @@ async def init_db_and_cache():
                 username TEXT,
                 first_name TEXT,
                 balance REAL DEFAULT 0,
-                joined_at TEXT
+                joined_at TEXT,
+                accepted_terms INTEGER DEFAULT 0
             )
         """)
+        # Безопасная миграция для существующей базы данных
+        async with DB_CONN.execute("PRAGMA table_info(users)") as cur:
+            user_cols = {row[1] for row in await cur.fetchall()}
+        if "accepted_terms" not in user_cols:
+            await DB_CONN.execute("ALTER TABLE users ADD COLUMN accepted_terms INTEGER DEFAULT 0")
+
         await DB_CONN.execute("""
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY,
@@ -1092,15 +1116,19 @@ async def init_db_and_cache():
         )
         await DB_CONN.commit()
 
-    PHOTO_CACHE.clear()
-    async with DB_CONN.execute("SELECT image_name, file_id, file_hash FROM media_cache_v2") as cur:
-        for img_name, fid, fhash in await cur.fetchall():
-            if FILE_HASHES.get(img_name) == fhash:
-                PHOTO_CACHE[img_name] = fid
+        PHOTO_CACHE.clear()
+        async with DB_CONN.execute("SELECT image_name, file_id, file_hash FROM media_cache_v2") as cur:
+            for img_name, fid, fhash in await cur.fetchall():
+                if FILE_HASHES.get(img_name) == fhash:
+                    PHOTO_CACHE[img_name] = fid
 
-    async with DB_CONN.execute("SELECT user_id FROM users") as cur:
-        for (uid,) in await cur.fetchall():
-            KNOWN_USERS.add(uid)
+        KNOWN_USERS.clear()
+        ACCEPTED_USERS.clear()
+        async with DB_CONN.execute("SELECT user_id, COALESCE(accepted_terms, 0) FROM users") as cur:
+            for uid, acc in await cur.fetchall():
+                KNOWN_USERS.add(uid)
+                if acc == 1:
+                    ACCEPTED_USERS.add(uid)
 
     await reload_catalog_cache()
 
@@ -1113,12 +1141,14 @@ async def reload_catalog_cache():
     RAM_CAT_KBS.clear()
     RAM_CAT_CAPTIONS.clear()
 
-    async with DB_CONN.execute("SELECT id, short_name, full_title, image_name, description FROM categories ORDER BY id") as cur:
-        cats = await cur.fetchall()
+    async with DB_LOCK:
+        async with DB_CONN.execute("SELECT id, short_name, full_title, image_name, description FROM categories ORDER BY id") as cur:
+            cats = await cur.fetchall()
+        async with DB_CONN.execute("SELECT id, category_id, full_name, btn_label, old_price, price, image_name FROM products ORDER BY id") as cur:
+            all_prods = await cur.fetchall()
 
     cat_builder = InlineKeyboardBuilder()
     cat_builder.button(text="🎮 Fortnite", callback_data="nav_fortnite")
-
     fn_builder = InlineKeyboardBuilder()
 
     for cid, sname, ftitle, cimg, cdesc in cats:
@@ -1143,9 +1173,6 @@ async def reload_catalog_cache():
         InlineKeyboardButton(text="🏠 Меню", callback_data="nav_home")
     )
     RAM_FORTNITE_KB = fn_builder.as_markup()
-
-    async with DB_CONN.execute("SELECT id, category_id, full_name, btn_label, old_price, price, image_name FROM products ORDER BY id") as cur:
-        all_prods = await cur.fetchall()
 
     prods_by_cat: dict[int, list] = {cid: [] for cid in RAM_CAT_ORDER}
     for pid, cid, fname, btn_lbl, old_p, price, pimg in all_prods:
@@ -1223,7 +1250,7 @@ async def register_user(user, force_update: bool = False):
         async with DB_LOCK:
             if is_new:
                 await DB_CONN.execute(
-                    "INSERT OR IGNORE INTO users (user_id, username, first_name, joined_at) VALUES (?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO users (user_id, username, first_name, joined_at, accepted_terms) VALUES (?, ?, ?, ?, 0)",
                     (user.id, uname, fname, datetime.now().strftime("%d.%m.%Y"))
                 )
             await DB_CONN.execute(
@@ -1237,7 +1264,23 @@ async def register_user(user, force_update: bool = False):
         logging.warning(f"Ошибка регистрации пользователя {user.id}: {e}")
 
 
-# ================= БЫСТРАЯ И БЕЗОПАСНАЯ ОТРИСОВКА ЭКРАНОВ =================
+async def set_user_accepted(user, accepted: bool):
+    await register_user(user, force_update=True)
+    val = 1 if accepted else 0
+    async with DB_LOCK:
+        await DB_CONN.execute("UPDATE users SET accepted_terms = ? WHERE user_id = ?", (val, user.id))
+        await DB_CONN.commit()
+    if accepted:
+        ACCEPTED_USERS.add(user.id)
+    else:
+        ACCEPTED_USERS.discard(user.id)
+
+
+# ================= ЗАЩИЩЁННАЯ ОТ ЗАВИСАНИЙ ОТРИСОВКА ЭКРАНОВ =================
+def _plain_len(html_text: str) -> int:
+    return len(html.unescape(re.sub(r"<[^>]+>", "", html_text)))
+
+
 def _get_user_lock(user_id: int) -> asyncio.Lock:
     if len(USER_LOCKS) > 2000:
         for uid in list(USER_LOCKS.keys())[:1000]:
@@ -1257,19 +1300,45 @@ def _remember_screen(chat_id: int, message_id: int, image_name: str):
     LAST_SCREEN_IMG[(chat_id, message_id)] = image_name
 
 
+async def _cleanup_aux_msgs(bot: Bot, chat_id: int, user_id: int):
+    msg_ids = AUX_MSGS.pop((chat_id, user_id), None)
+    if not msg_ids:
+        return
+    for mid in msg_ids:
+        try:
+            await asyncio.wait_for(bot.delete_message(chat_id=chat_id, message_id=mid), timeout=4.0)
+        except Exception:
+            pass
+
+
+def _add_aux_msg(chat_id: int, user_id: int, msg_id: int):
+    if len(AUX_MSGS) > 3000:
+        for k in list(AUX_MSGS.keys())[:1500]:
+            AUX_MSGS.pop(k, None)
+    AUX_MSGS.setdefault((chat_id, user_id), []).append(msg_id)
+
+
 async def _quick_answer(call: CallbackQuery, text: str | None = None, show_alert: bool = False):
     try:
-        await call.answer(text=text, show_alert=show_alert)
+        await asyncio.wait_for(call.answer(text=text, show_alert=show_alert), timeout=4.0)
     except Exception:
         pass
 
 
-async def _send_fresh_photo(msg_target: Message, image_name: str, caption: str, kb: InlineKeyboardMarkup):
+async def _send_fresh_photo(
+    msg_target: Message,
+    image_name: str,
+    caption: str,
+    kb: InlineKeyboardMarkup | None
+):
     cached_fid = PHOTO_CACHE.get(image_name)
     file_path = os.path.join(IMG_DIR, image_name)
     media_file = cached_fid or FSInputFile(file_path)
 
-    sent = await msg_target.answer_photo(photo=media_file, caption=caption, reply_markup=kb)
+    sent = await asyncio.wait_for(
+        msg_target.answer_photo(photo=media_file, caption=caption, reply_markup=kb),
+        timeout=15.0
+    )
     _remember_screen(sent.chat.id, sent.message_id, image_name)
     if not cached_fid and sent.photo:
         fid = sent.photo[-1].file_id
@@ -1278,106 +1347,194 @@ async def _send_fresh_photo(msg_target: Message, image_name: str, caption: str, 
     return sent
 
 
-async def show_screen(target, image_name: str, caption: str, kb: InlineKeyboardMarkup):
+async def _send_banner_and_long_text(
+    msg_target: Message,
+    user_id: int,
+    image_name: str,
+    full_text: str,
+    kb: InlineKeyboardMarkup | None
+):
+    """Для экранов длиннее 1000 символов: отправляет баннер + полный текст без риска ошибки caption_too_long."""
+    banner_title = full_text.split("\n", 1)[0][:200]
+    try:
+        banner_msg = await _send_fresh_photo(msg_target, image_name, banner_title, None)
+        _add_aux_msg(msg_target.chat.id, user_id, banner_msg.message_id)
+    except Exception as e:
+        logging.warning(f"Не удалось отправить баннер {image_name}: {e}")
+
+    safe_text = full_text if _plain_len(full_text) <= 4050 else full_text[:4000] + "..."
+    await asyncio.wait_for(
+        msg_target.answer(safe_text, reply_markup=kb, disable_web_page_preview=True),
+        timeout=12.0
+    )
+
+
+async def show_screen(
+    target: Message | CallbackQuery,
+    image_name: str,
+    caption: str,
+    kb: InlineKeyboardMarkup,
+    answer_cb: bool = True
+):
+    is_long = _plain_len(caption) > 1000
+
     if isinstance(target, CallbackQuery):
-        asyncio.create_task(_quick_answer(target))
-        lock = _get_user_lock(target.from_user.id)
-        async with lock:
+        if answer_cb:
+            asyncio.create_task(_quick_answer(target))
+        uid = target.from_user.id
+        lock = _get_user_lock(uid)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=4.0)
+        except asyncio.TimeoutError:
+            return
+        try:
             msg = target.message
             if not msg:
                 return
             chat_id, msg_id = msg.chat.id, msg.message_id
-            same_image = (LAST_SCREEN_IMG.get((chat_id, msg_id)) == image_name) and bool(msg.photo)
 
+            await _cleanup_aux_msgs(target.bot, chat_id, uid)
+
+            # Длинный экран (например, полная Политика или Соглашение)
+            if is_long:
+                LAST_SCREEN_IMG.pop((chat_id, msg_id), None)
+                try:
+                    await asyncio.wait_for(msg.delete(), timeout=4.0)
+                except Exception:
+                    pass
+                await _send_banner_and_long_text(msg, uid, image_name, caption, kb)
+                return
+
+            has_photo = bool(msg.photo)
+            same_image = (LAST_SCREEN_IMG.get((chat_id, msg_id)) == image_name) and has_photo
+
+            # Быстрый путь: картинка та же -> обновляем только подпись и кнопки
             if same_image:
                 try:
-                    await msg.edit_caption(caption=caption, reply_markup=kb)
+                    await asyncio.wait_for(msg.edit_caption(caption=caption, reply_markup=kb), timeout=12.0)
                     return
                 except TelegramBadRequest as e:
                     if "not modified" in str(e).lower():
                         return
                 except TelegramRetryAfter as e:
-                    await asyncio.sleep(min(e.retry_after, 2.5))
+                    await asyncio.sleep(min(e.retry_after, 2.0))
                     try:
-                        await msg.edit_caption(caption=caption, reply_markup=kb)
+                        await asyncio.wait_for(msg.edit_caption(caption=caption, reply_markup=kb), timeout=12.0)
                         return
                     except Exception:
                         pass
                 except Exception:
                     pass
 
-            cached_fid = PHOTO_CACHE.get(image_name)
-            media_file = cached_fid or FSInputFile(os.path.join(IMG_DIR, image_name))
-            try:
-                edited = await msg.edit_media(
-                    media=InputMediaPhoto(media=media_file, caption=caption, parse_mode=ParseMode.HTML),
-                    reply_markup=kb
-                )
-                _remember_screen(chat_id, msg_id, image_name)
-                if not cached_fid and edited and edited.photo:
-                    fid = edited.photo[-1].file_id
-                    PHOTO_CACHE[image_name] = fid
-                    asyncio.create_task(_save_file_id_bg(image_name, fid))
-                return
-            except TelegramBadRequest as e:
-                if "not modified" in str(e).lower():
+            # Обычный путь: сообщение с фото -> меняем медиа
+            if has_photo:
+                cached_fid = PHOTO_CACHE.get(image_name)
+                media_file = cached_fid or FSInputFile(os.path.join(IMG_DIR, image_name))
+                try:
+                    edited = await asyncio.wait_for(
+                        msg.edit_media(
+                            media=InputMediaPhoto(media=media_file, caption=caption, parse_mode=ParseMode.HTML),
+                            reply_markup=kb
+                        ),
+                        timeout=15.0
+                    )
+                    _remember_screen(chat_id, msg_id, image_name)
+                    if not cached_fid and edited and edited.photo:
+                        fid = edited.photo[-1].file_id
+                        PHOTO_CACHE[image_name] = fid
+                        asyncio.create_task(_save_file_id_bg(image_name, fid))
                     return
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(min(e.retry_after, 2.5))
-            except Exception:
-                pass
+                except TelegramBadRequest as e:
+                    if "not modified" in str(e).lower():
+                        return
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(min(e.retry_after, 2.0))
+                except Exception:
+                    pass
 
+            # Резервный путь (или переход с текстового экрана на фото-экран)
+            LAST_SCREEN_IMG.pop((chat_id, msg_id), None)
             try:
-                await msg.delete()
+                await asyncio.wait_for(msg.delete(), timeout=4.0)
             except Exception:
                 pass
             try:
                 await _send_fresh_photo(msg, image_name, caption, kb)
             except Exception as e:
                 logging.error(f"Ошибка отправки экрана {image_name}: {e}")
+        finally:
+            lock.release()
     else:
-        lock = _get_user_lock(target.from_user.id)
-        async with lock:
-            await _send_fresh_photo(target, image_name, caption, kb)
+        uid = target.from_user.id
+        lock = _get_user_lock(uid)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=4.0)
+        except asyncio.TimeoutError:
+            return
+        try:
+            await _cleanup_aux_msgs(target.bot, target.chat.id, uid)
+            if is_long:
+                await _send_banner_and_long_text(target, uid, image_name, caption, kb)
+            else:
+                await _send_fresh_photo(target, image_name, caption, kb)
+        finally:
+            lock.release()
 
 
-async def show_dynamic_photo(call: CallbackQuery, photo_file_id: str | None, fallback_image: str, caption: str, kb: InlineKeyboardMarkup):
-    """Отображает произвольное фото (например, аватар участника) с безопасным откатом на стандартный баннер."""
-    if not photo_file_id:
+async def show_dynamic_photo(
+    call: CallbackQuery,
+    photo_file_id: str | None,
+    fallback_image: str,
+    caption: str,
+    kb: InlineKeyboardMarkup
+):
+    """Отображает произвольное фото (аватар участника) с безопасным откатом на стандартный баннер."""
+    if not photo_file_id or _plain_len(caption) > 1000:
         await show_screen(call, fallback_image, caption, kb)
         return
 
     asyncio.create_task(_quick_answer(call))
-    lock = _get_user_lock(call.from_user.id)
-    async with lock:
+    uid = call.from_user.id
+    lock = _get_user_lock(uid)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=4.0)
+    except asyncio.TimeoutError:
+        return
+    try:
         msg = call.message
         if not msg:
             return
         chat_id, msg_id = msg.chat.id, msg.message_id
-        # Сбрасываем кэш статичного экрана, чтобы при возврате назад сработал edit_media
+        await _cleanup_aux_msgs(call.bot, chat_id, uid)
         LAST_SCREEN_IMG.pop((chat_id, msg_id), None)
 
-        try:
-            await msg.edit_media(
-                media=InputMediaPhoto(media=photo_file_id, caption=caption, parse_mode=ParseMode.HTML),
-                reply_markup=kb
-            )
-            return
-        except TelegramBadRequest as e:
-            if "not modified" in str(e).lower():
+        if msg.photo:
+            try:
+                await asyncio.wait_for(
+                    msg.edit_media(
+                        media=InputMediaPhoto(media=photo_file_id, caption=caption, parse_mode=ParseMode.HTML),
+                        reply_markup=kb
+                    ),
+                    timeout=12.0
+                )
                 return
-        except Exception:
-            pass
+            except TelegramBadRequest as e:
+                if "not modified" in str(e).lower():
+                    return
+            except Exception:
+                pass
 
         try:
-            await msg.delete()
+            await asyncio.wait_for(msg.delete(), timeout=4.0)
         except Exception:
             pass
         try:
-            await msg.answer_photo(photo=photo_file_id, caption=caption, reply_markup=kb)
+            await asyncio.wait_for(msg.answer_photo(photo=photo_file_id, caption=caption, reply_markup=kb), timeout=12.0)
             return
         except Exception:
             await _send_fresh_photo(msg, fallback_image, caption, kb)
+    finally:
+        lock.release()
 
 
 # ================= КЛАВИАТУРЫ =================
@@ -1410,6 +1567,35 @@ def inline_home_kb(user_id: int) -> InlineKeyboardMarkup:
 
 HOME_KB_USER = inline_home_kb(0)
 HOME_KB_ADMIN = inline_home_kb(ADMIN_ID)
+
+GATE_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [
+        InlineKeyboardButton(text="📄 Пользовательское соглашение", callback_data="gate_terms"),
+    ],
+    [
+        InlineKeyboardButton(text="🔒 Политика конфиденциальности", callback_data="gate_privacy"),
+    ],
+    [
+        InlineKeyboardButton(text="✅ Принимаю условия", callback_data="legal_accept"),
+    ],
+    [
+        InlineKeyboardButton(text="❌ Отказаться и выйти", callback_data="legal_decline"),
+    ],
+])
+
+GATE_DOC_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [
+        InlineKeyboardButton(text="📄 Соглашение", callback_data="gate_terms"),
+        InlineKeyboardButton(text="🔒 Политика", callback_data="gate_privacy"),
+    ],
+    [
+        InlineKeyboardButton(text="✅ Принимаю условия", callback_data="legal_accept"),
+        InlineKeyboardButton(text="❌ Отказаться", callback_data="legal_decline"),
+    ],
+    [
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="gate_back"),
+    ],
+])
 
 INFO_KB = InlineKeyboardMarkup(inline_keyboard=[
     [
@@ -1446,7 +1632,7 @@ LEGAL_KB = InlineKeyboardMarkup(inline_keyboard=[
 ])
 
 SUPPORT_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text=f"💬 Написать в Telegram ({SUPPORT_USERNAME})", url=SUPPORT_LINK)],
+    [InlineKeyboardButton(text=f"💬 Написать нам ({SUPPORT_USERNAME})", url=SUPPORT_LINK)],
     [
         InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav_home"),
         InlineKeyboardButton(text="🛒 Каталог", callback_data="nav_catalog")
@@ -1461,7 +1647,19 @@ BACK_XBOX_KB = InlineKeyboardMarkup(inline_keyboard=[
 ])
 
 
-# ================= ТЕКСТЫ ВИТРИНЫ =================
+# ================= ТЕКСТЫ ВИТРИНЫ И ЮРИДИЧЕСКИЕ ДОКУМЕНТЫ =================
+SAFE_SUPPORT_USER = html.escape(SUPPORT_USERNAME)
+
+GATE_TEXT = (
+    "🛡 <b>Добро пожаловать в Bombych Store!</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "Перед началом работы с магазином необходимо ознакомиться и согласиться с нашими документами:\n\n"
+    "<blockquote>📄 <b>Пользовательское соглашение</b> — правила оформления, оплаты, выдачи и возврата заказов.\n"
+    "🔒 <b>Политика конфиденциальности</b> — порядок сбора, хранения, защиты и нераспространения ваших данных.</blockquote>\n"
+    "Нажимая <b>«✅ Принимаю условия»</b>, вы подтверждаете согласие с обоими документами.\n"
+    "При отказе использование бота будет прекращено."
+)
+
 HOME_TEXT = (
     "💜 <b>Bombych Store • Магазин игрового доната</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
@@ -1470,8 +1668,7 @@ HOME_TEXT = (
     "📱 <b>Игры:</b> Brawl Stars, Roblox, Genshin, Standoff 2, Clash Royale, CoC, Free Fire, PUBG, Вирты\n"
     "💻 <b>Сервисы:</b> Telegram (Premium и Звёзды), Steam, Discord Nitro, ChatGPT, Spotify, ExitLag, Банки</blockquote>\n"
     "⏰ <b>График выдачи:</b> <code>05:00 – 22:00 (МСК)</code>\n"
-    "⚡ Прием заказов через бота — <b>круглосуточно (24/7)</b>\n"
-    "<i>Пользуясь ботом, вы соглашаетесь с Пользовательским соглашением и Политикой конфиденциальности.</i>\n\n"
+    "⚡ Прием заказов через бота — <b>круглосуточно (24/7)</b>\n\n"
     "👇 <b>Выберите нужный раздел:</b>"
 )
 
@@ -1519,39 +1716,61 @@ RULES_TEXT = (
 TERMS_TEXT = (
     "📄 <b>Пользовательское соглашение • Bombych Store</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "<blockquote><b>1. Общие положения</b>\n"
-    "Начиная использование бота Bombych Store, вы подтверждаете согласие с условиями данного соглашения.\n\n"
-    "<b>2. Оформление и оплата</b>\n"
-    "Магазин предоставляет услуги по приобретению и зачислению цифровых товаров, игровой валюты и подписок. "
-    "Заказ принимается в работу после проверки чека об оплате.\n\n"
-    "<b>3. Выдача и возврат</b>\n"
-    "Выдача производится в рабочие часы (05:00–22:00 МСК). После успешного зачисления цифрового товара возврат средств не осуществляется. "
-    "Если заказ невозможно выполнить по вине магазина, оформляется полный возврат.\n\n"
-    "<b>4. Ответственность</b>\n"
-    "Покупатель отвечает за корректность переданных данных (ID, UID, ник, регион).</blockquote>"
+    "<b>1. Общие положения</b>\n"
+    "1.1. Настоящее Соглашение регулирует порядок использования Telegram-бота Bombych Store (далее — Сервис).\n"
+    "1.2. Нажимая кнопку согласия и используя Сервис, Пользователь подтверждает полное принятие условий и достижение возраста 18 лет (либо наличие согласия законных представителей).\n\n"
+    "<b>2. Предмет соглашения</b>\n"
+    "2.1. Сервис оказывает услуги по приобретению и зачислению цифровых товаров, игровой валюты, кодов активации и подписок.\n"
+    "2.2. Сервис является независимой площадкой и не аффилирован с Epic Games, Supercell, Valve, Telegram, Discord, Roblox, miHoYo и иными правообладателями.\n\n"
+    "<b>3. Оформление и оплата заказов</b>\n"
+    "3.1. Актуальные цены указаны в каталоге Сервиса. Оплата производится по реквизитам, выданным при оформлении заказа.\n"
+    "3.2. Заказ поступает в обработку после предоставления действительного чека об оплате и его проверки администратором.\n\n"
+    "<b>4. Сроки выдачи и условия возврата</b>\n"
+    "4.1. Приём заявок ведётся 24/7, выдача выполняется в рабочие часы: <code>05:00 – 22:00 (МСК)</code>.\n"
+    "4.2. Цифровые товары, коды и внутриигровые зачисления надлежащего качества после передачи/активации возврату и обмену не подлежат.\n"
+    "4.3. Если заказ невозможно выполнить по вине Сервиса, Пользователю осуществляется полный возврат оплаченной суммы.\n\n"
+    "<b>5. Права, обязанности и ограничения</b>\n"
+    "5.1. Пользователь несёт полную ответственность за корректность переданных данных (ID, UID, @username, регион, привязка Xbox/Supercell ID).\n"
+    "5.2. Запрещена отправка поддельных чеков, спам, оскорбления администрации и попытки обхода работы Сервиса. При нарушении доступ блокируется.\n"
+    "5.3. Сервис не отвечает за временные сбои платёжных шлюзов, Telegram или игровых серверов, а также за ограничения, наложенные правообладателями игр.\n\n"
+    "<b>6. Заключительные положения</b>\n"
+    f"6.1. Администрация вправе обновлять Соглашение без предварительного уведомления. По всем вопросам обращайтесь к нам в поддержку: {SAFE_SUPPORT_USER}."
 )
 
 PRIVACY_TEXT = (
     "🔒 <b>Политика конфиденциальности • Bombych Store</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "<blockquote><b>1. Какие данные собираются</b>\n"
-    "Бот сохраняет технические данные Telegram (ID, @username, имя) и историю ваших заказов для работы сервиса и поддержки.\n\n"
-    "<b>2. Данные игровых аккаунтов</b>\n"
-    "Сведения, переданные для зачисления товара, используются строго один раз для выполнения заказа и не сохраняются после выдачи.\n\n"
-    "<b>3. Защита информации</b>\n"
-    "Ваши данные не передаются и не продаются третьим лицам.\n\n"
-    "<b>4. Обращения и удаление данных</b>\n"
-    f"По вопросам обработки или удаления ваших данных обращайтесь напрямую: {SUPPORT_USERNAME}</blockquote>"
+    "<b>1. Общие положения</b>\n"
+    "1.1. Настоящая Политика определяет порядок сбора, хранения, обработки и защиты персональных данных пользователей бота Bombych Store (в соответствии с базовыми принципами ФЗ № 152-ФЗ «О персональных данных»).\n"
+    "1.2. Использование Сервиса означает безоговорочное согласие Пользователя с данной Политикой.\n\n"
+    "<b>2. Какие данные мы собираем</b>\n"
+    "• <b>Данные Telegram:</b> уникальный ID, @username, отображаемое имя, дата регистрации в боте.\n"
+    "• <b>Данные заказов:</b> выбранные позиции, суммы, способы оплаты, статусы, скриншоты/файлы чеков и комментарии к заказам.\n"
+    "• <b>Данные для зачисления:</b> игровой ID, UID, тег, почта или временные реквизиты доступа, переданные самим Пользователем для выполнения конкретного заказа.\n\n"
+    "<b>3. Цели обработки персональных данных</b>\n"
+    "• Идентификация Пользователя и ведение личного кабинета и истории покупок.\n"
+    "• Проверка оплаты, выполнение заказов и оказание технической поддержки.\n"
+    "• Информирование о статусах заказов, акциях и важных обновлениях Сервиса.\n\n"
+    "<b>4. Хранение и защита информации</b>\n"
+    "4.1. Технические данные и история заказов хранятся в защищённой базе данных с ограниченным доступом.\n"
+    "4.2. Данные игровых аккаунтов используются <b>строго однократно</b> для зачисления товара и безвозвратно удаляются сразу после выполнения заказа.\n"
+    "4.3. Администрация принимает необходимые организационные и технические меры для защиты данных от утечки, утраты и несанкционированного доступа.\n\n"
+    "<b>5. Распространение и передача третьим лицам</b>\n"
+    "5.1. Личные данные Пользователей <b>не продаются, не публикуются и не распространяются</b> среди третьих лиц.\n"
+    "5.2. Передача сведений возможна исключительно в двух случаях: если это технически необходимо для проведения платежа/доставки товара, либо по законному официальному запросу уполномоченных государственных органов.\n\n"
+    "<b>6. Права пользователя и удаление данных</b>\n"
+    "6.1. Пользователь вправе запросить сведения о своих хранящихся данных, потребовать их исправления, отказаться от рассылок или запросить полное удаление профиля из базы.\n"
+    f"6.2. Для реализации этих прав и по любым вопросам конфиденциальности напишите нам в поддержку: {SAFE_SUPPORT_USER}."
 )
 
 SUPPORT_TEXT = (
     "🆘 <b>Поддержка • Bombych Store</b>\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "<blockquote>По любым вопросам — помощь с выбором товара, оплата, статус заказа, "
-    "привязка аккаунта или сотрудничество — обращайтесь напрямую ко мне в Telegram.</blockquote>\n"
-    f"👤 <b>Мой контакт:</b> {SUPPORT_USERNAME}\n"
+    "привязка аккаунта, возврат или сотрудничество — обращайтесь к нам в Telegram.</blockquote>\n"
+    f"👤 <b>Контакт поддержки:</b> {SAFE_SUPPORT_USER}\n"
     "⏰ <b>Время ответа:</b> <code>05:00 – 22:00 (МСК)</code>\n\n"
-    "👇 <b>Нажмите кнопку ниже, чтобы сразу написать мне:</b>"
+    "👇 <b>Нажмите кнопку ниже, чтобы сразу написать нам:</b>"
 )
 
 XBOX_TEXT = (
@@ -1567,16 +1786,174 @@ XBOX_TEXT = (
 )
 
 
+# ================= ЗАЩИТА ПЕРВОГО ВХОДА (СОГЛАСИЕ С УСЛОВИЯМИ) =================
+async def send_consent_gate(message: Message):
+    try:
+        rm_msg = await asyncio.wait_for(
+            message.answer("👋 <b>Добро пожаловать в Bombych Store!</b>", reply_markup=ReplyKeyboardRemove()),
+            timeout=10.0
+        )
+        _add_aux_msg(message.chat.id, message.from_user.id, rm_msg.message_id)
+    except Exception:
+        pass
+    await show_screen(message, "main.jpg", GATE_TEXT, GATE_KB)
+
+
+class TermsGateMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = getattr(event, "from_user", None)
+        if not user or user.id in ACCEPTED_USERS:
+            return await handler(event, data)
+
+        if isinstance(event, Message):
+            text = (event.text or "").strip()
+            if text.startswith("/start") or (user.id == ADMIN_ID and text.startswith("/reset_terms")):
+                return await handler(event, data)
+            await send_consent_gate(event)
+            return None
+
+        if isinstance(event, CallbackQuery):
+            cb_data = event.data or ""
+            if cb_data in {"legal_accept", "legal_decline", "gate_terms", "gate_privacy", "gate_back"}:
+                return await handler(event, data)
+            await _quick_answer(
+                event,
+                "Сначала ознакомьтесь и примите Пользовательское соглашение и Политику конфиденциальности.",
+                show_alert=True
+            )
+            await show_screen(event, "main.jpg", GATE_TEXT, GATE_KB, answer_cb=False)
+            return None
+
+        return await handler(event, data)
+
+
+router.message.middleware(TermsGateMiddleware())
+router.callback_query.middleware(TermsGateMiddleware())
+
+
+@router.callback_query(F.data == "gate_terms")
+async def cb_gate_terms(call: CallbackQuery):
+    await show_screen(call, "terms.jpg", TERMS_TEXT, GATE_DOC_KB)
+
+
+@router.callback_query(F.data == "gate_privacy")
+async def cb_gate_privacy(call: CallbackQuery):
+    await show_screen(call, "privacy.jpg", PRIVACY_TEXT, GATE_DOC_KB)
+
+
+@router.callback_query(F.data == "gate_back")
+async def cb_gate_back(call: CallbackQuery):
+    await show_screen(call, "main.jpg", GATE_TEXT, GATE_KB)
+
+
+@router.callback_query(F.data == "legal_accept")
+async def cb_legal_accept(call: CallbackQuery, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
+    await _quick_answer(call, "✅ Условия приняты! Добро пожаловать в Bombych Store!")
+    await set_user_accepted(call.from_user, True)
+
+    uid = call.from_user.id
+    lock = _get_user_lock(uid)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=4.0)
+    except asyncio.TimeoutError:
+        return
+    try:
+        msg = call.message
+        if msg:
+            await _cleanup_aux_msgs(call.bot, msg.chat.id, uid)
+            LAST_SCREEN_IMG.pop((msg.chat.id, msg.message_id), None)
+            try:
+                await asyncio.wait_for(msg.delete(), timeout=4.0)
+            except Exception:
+                pass
+            await asyncio.wait_for(
+                msg.answer(
+                    "💜 <b>Добро пожаловать в официальный магазин Bombych Store!</b>",
+                    reply_markup=reply_main_kb(uid)
+                ),
+                timeout=10.0
+            )
+            kb = HOME_KB_ADMIN if uid == ADMIN_ID else HOME_KB_USER
+            await _send_fresh_photo(msg, "main.jpg", HOME_TEXT, kb)
+    finally:
+        lock.release()
+
+
+@router.callback_query(F.data == "legal_decline")
+async def cb_legal_decline(call: CallbackQuery, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
+    await _quick_answer(
+        call,
+        "Вы отказались от условий. Использование бота невозможно без принятия Соглашения и Политики конфиденциальности.",
+        show_alert=True
+    )
+    await set_user_accepted(call.from_user, False)
+
+    uid = call.from_user.id
+    lock = _get_user_lock(uid)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=4.0)
+    except asyncio.TimeoutError:
+        return
+    try:
+        msg = call.message
+        if msg:
+            await _cleanup_aux_msgs(call.bot, msg.chat.id, uid)
+            LAST_SCREEN_IMG.pop((msg.chat.id, msg.message_id), None)
+            try:
+                await asyncio.wait_for(msg.delete(), timeout=4.0)
+            except Exception:
+                pass
+            await asyncio.wait_for(
+                msg.answer(
+                    "🚪 <b>Вы вышли из бота Bombych Store.</b>\n\n"
+                    "Для использования магазина необходимо принять Пользовательское соглашение и Политику конфиденциальности.\n\n"
+                    "Если передумаете — просто нажмите /start.",
+                    reply_markup=ReplyKeyboardRemove()
+                ),
+                timeout=10.0
+            )
+    finally:
+        lock.release()
+
+
+@router.message(Command("reset_terms"))
+async def cmd_reset_terms(message: Message, state: FSMContext):
+    """Служебная команда только для админа, чтобы повторно проверить окно согласия."""
+    if message.from_user.id != ADMIN_ID:
+        return
+    if await state.get_state():
+        await state.clear()
+    await set_user_accepted(message.from_user, False)
+    await send_consent_gate(message)
+
+
 # ================= НАВИГАЦИЯ =================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     if await state.get_state():
         await state.clear()
     await register_user(message.from_user, force_update=True)
+
+    if message.from_user.id not in ACCEPTED_USERS:
+        await send_consent_gate(message)
+        return
+
     kb = HOME_KB_ADMIN if message.from_user.id == ADMIN_ID else HOME_KB_USER
-    await message.answer(
-        "💜 <b>Добро пожаловать в официальный магазин Bombych Store!</b>",
-        reply_markup=reply_main_kb(message.from_user.id)
+    await asyncio.wait_for(
+        message.answer(
+            "💜 <b>Добро пожаловать в официальный магазин Bombych Store!</b>",
+            reply_markup=reply_main_kb(message.from_user.id)
+        ),
+        timeout=10.0
     )
     await show_screen(message, "main.jpg", HOME_TEXT, kb)
 
@@ -1702,15 +2079,16 @@ async def cb_support(call: CallbackQuery, state: FSMContext):
 # ================= ПРОФИЛЬ И ИСТОРИЯ ЗАКАЗОВ =================
 async def build_profile_view(user):
     await register_user(user)
-    async with DB_CONN.execute("SELECT balance, joined_at FROM users WHERE user_id = ?", (user.id,)) as cur:
-        row = await cur.fetchone()
-    balance, joined_at = row if row else (0.0, datetime.now().strftime("%d.%m.%Y"))
+    async with DB_LOCK:
+        async with DB_CONN.execute("SELECT balance, joined_at FROM users WHERE user_id = ?", (user.id,)) as cur:
+            row = await cur.fetchone()
+        async with DB_CONN.execute(
+            "SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE user_id = ? AND status = 'completed'",
+            (user.id,)
+        ) as cur:
+            done_cnt, total_spent = await cur.fetchone()
 
-    async with DB_CONN.execute(
-        "SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE user_id = ? AND status = 'completed'",
-        (user.id,)
-    ) as cur:
-        done_cnt, total_spent = await cur.fetchone()
+    balance, joined_at = row if row else (0.0, datetime.now().strftime("%d.%m.%Y"))
 
     if user.id == ADMIN_ID:
         role = "Основатель ♦"
@@ -1765,11 +2143,12 @@ async def cb_profile(call: CallbackQuery, state: FSMContext):
 async def cb_my_orders(call: CallbackQuery, state: FSMContext):
     if await state.get_state():
         await state.clear()
-    async with DB_CONN.execute(
-        "SELECT id, product_name, price, status FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 8",
-        (call.from_user.id,)
-    ) as cur:
-        rows = await cur.fetchall()
+    async with DB_LOCK:
+        async with DB_CONN.execute(
+            "SELECT id, product_name, price, status FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 8",
+            (call.from_user.id,)
+        ) as cur:
+            rows = await cur.fetchall()
 
     st_icons = {
         "pending": "⏳ Ожидает оплаты",
@@ -1860,8 +2239,6 @@ async def cb_sbp_soon(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("pay_da_") | F.data.startswith("pay_crypto_"))
 async def cb_pay(call: CallbackQuery, state: FSMContext):
-    asyncio.create_task(_quick_answer(call))
-    await register_user(call.from_user)
     parts = call.data.split("_")
     try:
         method, pid = parts[1], int(parts[2])
@@ -1871,6 +2248,9 @@ async def cb_pay(call: CallbackQuery, state: FSMContext):
     prod = RAM_PRODS.get(pid)
     if not prod:
         return await _quick_answer(call, "Товар не найден", show_alert=True)
+
+    asyncio.create_task(_quick_answer(call))
+    await register_user(call.from_user)
 
     m_name = "DonationAlerts" if method == "da" else "Криптовалюта"
     async with DB_LOCK:
@@ -1901,7 +2281,7 @@ async def cb_pay(call: CallbackQuery, state: FSMContext):
         InlineKeyboardButton(text="❌ Отмена", callback_data=f"cat_{prod['category_id']}")
     ])
 
-    await show_screen(call, prod["image_name"], caption, InlineKeyboardMarkup(inline_keyboard=buttons))
+    await show_screen(call, prod["image_name"], caption, InlineKeyboardMarkup(inline_keyboard=buttons), answer_cb=False)
 
 
 @router.callback_query(F.data.startswith("sendcheck_"))
@@ -1924,10 +2304,11 @@ async def cb_sendcheck(call: CallbackQuery, state: FSMContext):
     price = data.get("price")
 
     if (not fname or price is None) and order_id:
-        async with DB_CONN.execute("SELECT product_name, price FROM orders WHERE id = ?", (order_id,)) as cur:
-            row = await cur.fetchone()
-            if row:
-                fname, price = row
+        async with DB_LOCK:
+            async with DB_CONN.execute("SELECT product_name, price FROM orders WHERE id = ?", (order_id,)) as cur:
+                row = await cur.fetchone()
+        if row:
+            fname, price = row
 
     await state.update_data(order_id=order_id, fname=fname or "Товар", price=price or 0, pid=pid)
     await state.set_state(OrderFlow.waiting_receipt)
@@ -1938,10 +2319,13 @@ async def cb_sendcheck(call: CallbackQuery, state: FSMContext):
             InlineKeyboardButton(text="❌ Отмена", callback_data="nav_home")
         ]
     ])
-    await call.message.answer(
-        f"📸 <b>Прикрепите скриншот или файл чека по заказу #{order_id} в этот чат.</b>\n"
-        "<i>В подписи к файлу вы можете сразу указать игровой ID, UID, тег или почту для быстрого выполнения заказа.</i>",
-        reply_markup=kb
+    await asyncio.wait_for(
+        call.message.answer(
+            f"📸 <b>Прикрепите скриншот или файл чека по заказу #{order_id} в этот чат.</b>\n"
+            "<i>В подписи к файлу вы можете сразу указать игровой ID, UID, тег или почту для быстрого выполнения заказа.</i>",
+            reply_markup=kb
+        ),
+        timeout=10.0
     )
 
 
@@ -1977,9 +2361,15 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
 
     try:
         if message.photo:
-            await bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=adm_caption, reply_markup=adm_kb)
+            await asyncio.wait_for(
+                bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=adm_caption, reply_markup=adm_kb),
+                timeout=12.0
+            )
         else:
-            await bot.send_document(chat_id=ADMIN_ID, document=message.document.file_id, caption=adm_caption, reply_markup=adm_kb)
+            await asyncio.wait_for(
+                bot.send_document(chat_id=ADMIN_ID, document=message.document.file_id, caption=adm_caption, reply_markup=adm_kb),
+                timeout=12.0
+            )
     except Exception as e:
         logging.error(f"Не удалось переслать чек #{order_id} администратору: {e}")
 
@@ -1989,10 +2379,13 @@ async def receive_receipt(message: Message, state: FSMContext, bot: Bot):
             InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav_home")
         ]
     ])
-    await message.answer(
-        f"✅ <b>Чек по заказу #{order_id} отправлен на проверку!</b>\n"
-        "Уведомление о выполнении заказа придет в этот чат.",
-        reply_markup=kb
+    await asyncio.wait_for(
+        message.answer(
+            f"✅ <b>Чек по заказу #{order_id} отправлен на проверку!</b>\n"
+            "Уведомление о выполнении заказа придет в этот чат.",
+            reply_markup=kb
+        ),
+        timeout=10.0
     )
 
 
@@ -2001,7 +2394,10 @@ async def wrong_receipt(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отменить отправку чека", callback_data="nav_home")]
     ])
-    await message.answer("⚠️ Пожалуйста, отправьте <b>скриншот, фотографию или файл</b> чека.", reply_markup=kb)
+    await asyncio.wait_for(
+        message.answer("⚠️ Пожалуйста, отправьте <b>скриншот, фотографию или файл</b> чека.", reply_markup=kb),
+        timeout=10.0
+    )
 
 
 # ================= АДМИН-ПАНЕЛЬ И УЧАСТНИКИ =================
@@ -2017,19 +2413,25 @@ async def cb_adm_ok(call: CallbackQuery, bot: Bot):
         await DB_CONN.commit()
 
     try:
-        await bot.send_message(
-            chat_id=uid,
-            text=(
-                f"🎉 <b>Оплата по заказу #{oid} подтверждена!</b>\n"
-                "Ваш заказ принят к выдаче. При необходимости уточнения данных администратор свяжется с вами в ЛС.\n"
-                "💜 Спасибо за покупку в <b>Bombych Store</b>!"
-            )
+        await asyncio.wait_for(
+            bot.send_message(
+                chat_id=uid,
+                text=(
+                    f"🎉 <b>Оплата по заказу #{oid} подтверждена!</b>\n"
+                    "Ваш заказ принят к выдаче. При необходимости уточнения данных администратор свяжется с вами в ЛС.\n"
+                    "💜 Спасибо за покупку в <b>Bombych Store</b>!"
+                )
+            ),
+            timeout=10.0
         )
     except Exception as e:
         logging.warning(f"Не удалось уведомить клиента {uid} о заказе #{oid}: {e}")
 
     try:
-        await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ <b>ВЫПОЛНЕНО</b>")
+        await asyncio.wait_for(
+            call.message.edit_caption(caption=(call.message.caption or "") + "\n\n✅ <b>ВЫПОЛНЕНО</b>"),
+            timeout=10.0
+        )
     except Exception:
         pass
     await _quick_answer(call, "Заказ подтвержден!")
@@ -2047,15 +2449,21 @@ async def cb_adm_no(call: CallbackQuery, bot: Bot):
         await DB_CONN.commit()
 
     try:
-        await bot.send_message(
-            chat_id=uid,
-            text=f"❌ <b>Заказ #{oid} отклонен.</b>\nОплата не найдена. Проверьте чек или обратитесь в поддержку ({SUPPORT_USERNAME})."
+        await asyncio.wait_for(
+            bot.send_message(
+                chat_id=uid,
+                text=f"❌ <b>Заказ #{oid} отклонен.</b>\nОплата не найдена. Проверьте чек или напишите нам в поддержку ({SAFE_SUPPORT_USER})."
+            ),
+            timeout=10.0
         )
     except Exception as e:
         logging.warning(f"Не удалось уведомить клиента {uid} об отказе #{oid}: {e}")
 
     try:
-        await call.message.edit_caption(caption=(call.message.caption or "") + "\n\n❌ <b>ОТКЛОНЕНО</b>")
+        await asyncio.wait_for(
+            call.message.edit_caption(caption=(call.message.caption or "") + "\n\n❌ <b>ОТКЛОНЕНО</b>"),
+            timeout=10.0
+        )
     except Exception:
         pass
     await _quick_answer(call, "Отклонено.")
@@ -2081,10 +2489,11 @@ async def cb_admin(call: CallbackQuery, state: FSMContext):
 
 
 async def render_admin(target):
-    async with DB_CONN.execute("SELECT COUNT(*) FROM users") as cur:
-        u_cnt = (await cur.fetchone())[0]
-    async with DB_CONN.execute("SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE status = 'completed'") as cur:
-        o_cnt, rev = await cur.fetchone()
+    async with DB_LOCK:
+        async with DB_CONN.execute("SELECT COUNT(*) FROM users") as cur:
+            u_cnt = (await cur.fetchone())[0]
+        async with DB_CONN.execute("SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE status = 'completed'") as cur:
+            o_cnt, rev = await cur.fetchone()
 
     text = (
         "⚙️ <b>Панель управления • Bombych Store</b>\n"
@@ -2116,19 +2525,18 @@ async def cb_adm_users(call: CallbackQuery, state: FSMContext):
     except (IndexError, ValueError):
         page = 0
 
-    async with DB_CONN.execute("SELECT COUNT(*) FROM users") as cur:
-        total = (await cur.fetchone())[0]
-
-    total_pages = max(1, math.ceil(total / USERS_PER_PAGE))
-    if page >= total_pages:
-        page = total_pages - 1
-
-    offset = page * USERS_PER_PAGE
-    async with DB_CONN.execute(
-        "SELECT user_id, username, first_name, joined_at FROM users ORDER BY rowid DESC LIMIT ? OFFSET ?",
-        (USERS_PER_PAGE, offset)
-    ) as cur:
-        rows = await cur.fetchall()
+    async with DB_LOCK:
+        async with DB_CONN.execute("SELECT COUNT(*) FROM users") as cur:
+            total = (await cur.fetchone())[0]
+        total_pages = max(1, math.ceil(total / USERS_PER_PAGE))
+        if page >= total_pages:
+            page = total_pages - 1
+        offset = page * USERS_PER_PAGE
+        async with DB_CONN.execute(
+            "SELECT user_id, username, first_name, joined_at FROM users ORDER BY rowid DESC LIMIT ? OFFSET ?",
+            (USERS_PER_PAGE, offset)
+        ) as cur:
+            rows = await cur.fetchall()
 
     b = InlineKeyboardBuilder()
     lines = []
@@ -2191,20 +2599,28 @@ async def cb_adm_user_card(call: CallbackQuery, state: FSMContext, bot: Bot):
     except (IndexError, ValueError):
         return await _quick_answer(call, "Участник не найден", show_alert=True)
 
-    async with DB_CONN.execute(
-        "SELECT username, first_name, balance, joined_at FROM users WHERE user_id = ?",
-        (uid,)
-    ) as cur:
-        row = await cur.fetchone()
+    async with DB_LOCK:
+        async with DB_CONN.execute(
+            "SELECT username, first_name, balance, joined_at FROM users WHERE user_id = ?",
+            (uid,)
+        ) as cur:
+            row = await cur.fetchone()
+        async with DB_CONN.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), "
+            "COALESCE(SUM(CASE WHEN status = 'completed' THEN price ELSE 0 END), 0) "
+            "FROM orders WHERE user_id = ?",
+            (uid,)
+        ) as cur:
+            total_orders, done_orders, total_spent = await cur.fetchone()
 
     if not row:
         return await _quick_answer(call, "Участник не найден в базе", show_alert=True)
 
     uname, fname, balance, joined_at = row
+    done_orders = done_orders or 0
 
-    # Пробуем подтянуть актуальное имя и username напрямую из Telegram
     try:
-        chat = await bot.get_chat(uid)
+        chat = await asyncio.wait_for(bot.get_chat(uid), timeout=4.0)
         fresh_uname = chat.username or ""
         fresh_fname = chat.first_name or fname or "Гость"
         if fresh_uname != (uname or "") or fresh_fname != (fname or ""):
@@ -2218,23 +2634,13 @@ async def cb_adm_user_card(call: CallbackQuery, state: FSMContext, bot: Bot):
     except Exception:
         pass
 
-    # Пробуем получить текущую аватарку пользователя из Telegram
     avatar_fid = None
     try:
-        photos = await bot.get_user_profile_photos(user_id=uid, limit=1)
+        photos = await asyncio.wait_for(bot.get_user_profile_photos(user_id=uid, limit=1), timeout=4.0)
         if photos.total_count > 0 and photos.photos:
             avatar_fid = photos.photos[0][-1].file_id
     except Exception:
         pass
-
-    async with DB_CONN.execute(
-        "SELECT COUNT(*), SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), "
-        "COALESCE(SUM(CASE WHEN status = 'completed' THEN price ELSE 0 END), 0) "
-        "FROM orders WHERE user_id = ?",
-        (uid,)
-    ) as cur:
-        total_orders, done_orders, total_spent = await cur.fetchone()
-        done_orders = done_orders or 0
 
     clean_u = _clean_username(uname)
     u_line = f"@{html.escape(clean_u)}" if clean_u else "<i>не установлен</i>"
@@ -2275,7 +2681,10 @@ async def cb_adm_add_item(call: CallbackQuery):
         b.button(text=label, callback_data=f"admcat_{cid}")
     b.adjust(2)
     b.row(InlineKeyboardButton(text="⬅️ Отмена", callback_data="nav_admin"))
-    await call.message.answer("📂 <b>Выберите категорию для нового товара:</b>", reply_markup=b.as_markup())
+    await asyncio.wait_for(
+        call.message.answer("📂 <b>Выберите категорию для нового товара:</b>", reply_markup=b.as_markup()),
+        timeout=10.0
+    )
 
 
 @router.callback_query(F.data.startswith("admcat_"))
@@ -2286,21 +2695,30 @@ async def cb_adm_pick_cat(call: CallbackQuery, state: FSMContext):
     cid = int(call.data.split("_")[1])
     await state.update_data(cid=cid)
     await state.set_state(AdminFlow.add_full_name)
-    await call.message.answer("✏️ Введите <b>полное название товара</b> (например: <code>4500 В-Баксов</code>):")
+    await asyncio.wait_for(
+        call.message.answer("✏️ Введите <b>полное название товара</b> (например: <code>4500 В-Баксов</code>):"),
+        timeout=10.0
+    )
 
 
 @router.message(AdminFlow.add_full_name)
 async def adm_set_fname(message: Message, state: FSMContext):
     await state.update_data(fname=(message.text or "").strip())
     await state.set_state(AdminFlow.add_short_btn)
-    await message.answer("🔘 Введите <b>короткое название для кнопки</b> до 10 символов (например: <code>💎 4500 ВБ</code>):")
+    await asyncio.wait_for(
+        message.answer("🔘 Введите <b>короткое название для кнопки</b> до 10 символов (например: <code>💎 4500 ВБ</code>):"),
+        timeout=10.0
+    )
 
 
 @router.message(AdminFlow.add_short_btn)
 async def adm_set_sbtn(message: Message, state: FSMContext):
     await state.update_data(sbtn=(message.text or "").strip())
     await state.set_state(AdminFlow.add_price)
-    await message.answer("💰 Введите <b>цену в рублях</b> (бот сам сделает скидку -20%, либо введите две цены через пробел: <code>старая новая</code>):")
+    await asyncio.wait_for(
+        message.answer("💰 Введите <b>цену в рублях</b> (бот сам сделает скидку -20%, либо введите две цены через пробел: <code>старая новая</code>):"),
+        timeout=10.0
+    )
 
 
 @router.message(AdminFlow.add_price)
@@ -2313,7 +2731,10 @@ async def adm_save_product(message: Message, state: FSMContext):
             old_p = int(float(parts[0]))
             new_p = max(10, int(round(old_p * 0.80)))
     except (ValueError, IndexError):
-        return await message.answer("⚠️ Введите число (например <code>500</code> или <code>500 400</code>):")
+        return await asyncio.wait_for(
+            message.answer("⚠️ Введите число (например <code>500</code> или <code>500 400</code>):"),
+            timeout=10.0
+        )
 
     data = await state.get_data()
     await state.clear()
@@ -2328,9 +2749,12 @@ async def adm_save_product(message: Message, state: FSMContext):
         await DB_CONN.commit()
     await reload_catalog_cache()
 
-    await message.answer(
-        f"✅ Товар <b>{html.escape(data['fname'])}</b> добавлен!\n"
-        f"Цена: <s>{old_p}₽</s> → <b>{new_p}₽</b> (Кнопка: <code>{html.escape(btn_lbl)}</code>)"
+    await asyncio.wait_for(
+        message.answer(
+            f"✅ Товар <b>{html.escape(data['fname'])}</b> добавлен!\n"
+            f"Цена: <s>{old_p}₽</s> → <b>{new_p}₽</b> (Кнопка: <code>{html.escape(btn_lbl)}</code>)"
+        ),
+        timeout=10.0
     )
 
 
@@ -2341,24 +2765,34 @@ async def cb_broadcast(call: CallbackQuery, state: FSMContext):
     asyncio.create_task(_quick_answer(call))
     await state.set_state(AdminFlow.waiting_broadcast)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="nav_admin")]])
-    await call.message.answer("📢 Введите текст рассылки для всех клиентов:", reply_markup=kb)
+    await asyncio.wait_for(
+        call.message.answer("📢 Введите текст рассылки для всех клиентов:", reply_markup=kb),
+        timeout=10.0
+    )
 
 
 @router.message(AdminFlow.waiting_broadcast)
 async def run_broadcast(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
-    async with DB_CONN.execute("SELECT user_id FROM users") as cur:
-        users = await cur.fetchall()
+    async with DB_LOCK:
+        async with DB_CONN.execute("SELECT user_id FROM users") as cur:
+            users = await cur.fetchall()
     safe_text = html.escape(message.text or "")
     sent = 0
     for (uid,) in users:
         try:
-            await bot.send_message(uid, f"📢 <b>Новости • Bombych Store</b>\n\n{safe_text}")
+            await asyncio.wait_for(
+                bot.send_message(uid, f"📢 <b>Новости • Bombych Store</b>\n\n{safe_text}"),
+                timeout=8.0
+            )
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
             pass
-    await message.answer(f"✅ Рассылка доставлена <b>{sent}</b> клиентам.")
+    await asyncio.wait_for(
+        message.answer(f"✅ Рассылка доставлена <b>{sent}</b> клиентам."),
+        timeout=10.0
+    )
 
 
 # ================= ГЛОБАЛЬНЫЙ ПЕРЕХВАТЧИК ОШИБОК =================
@@ -2366,7 +2800,7 @@ async def run_broadcast(message: Message, state: FSMContext, bot: Bot):
 async def global_error_handler(event: ErrorEvent):
     logging.exception(f"Необработанная ошибка в апдейте: {event.exception}")
     if event.update.callback_query:
-        await _quick_answer(event.update.callback_query, "⚠️ Произошла временная ошибка, попробуйте ещё раз.")
+        await _quick_answer(event.update.callback_query, "⚠️ Временная ошибка, нажмите кнопку ещё раз.")
 
 
 # ================= МЕНЮ «☰» И ЗАПУСК =================
@@ -2392,19 +2826,20 @@ async def main():
     prepare_all_banners()
     await init_db_and_cache()
 
-    session = AiohttpSession(timeout=25)
+    # Таймаут сессии строго больше polling_timeout, чтобы long-polling никогда не обрывался по таймауту
+    session = AiohttpSession(timeout=60)
     bot = Bot(token=BOT_TOKEN, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await setup_menu_commands(bot)
 
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Bombych Store v13 успешно запущен!")
+    logging.info("Bombych Store v14 успешно запущен!")
     try:
         await dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),
-            polling_timeout=25
+            polling_timeout=20
         )
     finally:
         await bot.session.close()
