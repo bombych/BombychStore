@@ -48,6 +48,7 @@ ADMIN_ID = 5157852376
 SUPPORT_USERNAME = "@bombych"
 SUPPORT_LINK = f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}"
 DONATIONALERTS_URL = "https://www.donationalerts.com/r/bombychyt"
+TON_WALLET = "UQAmhiehcvEaSqZZ-aTZK0RPDw2CDEzjSkiZymwYiyrMWbPw"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.getenv("DATA_DIR") or BASE_DIR
@@ -70,10 +71,11 @@ PAYMENT_DA_TEXT = (
 )
 
 PAYMENT_CRYPTO_TEXT = (
-    "🪙 <b>Оплата криптовалютой (USDT / TON):</b>\n"
-    "<blockquote>🌐 Сеть: <b>TON / TRC20</b>\n"
-    "👛 Кошелек: <code>UQBombyStoreWalletAddressHere</code></blockquote>\n"
-    "📌 После перевода нажмите <b>«📸 Отправить чек»</b> и прикрепите скриншот транзакции."
+    "🪙 <b>Оплата криптовалютой (TON / USDT в сети TON):</b>\n"
+    "<blockquote>🌐 Сеть: <b>TON (The Open Network)</b>\n"
+    f"👛 Кошелек: <code>{TON_WALLET}</code></blockquote>\n"
+    "📌 Нажмите на адрес кошелька выше, чтобы скопировать его.\n"
+    "После перевода нажмите <b>«📸 Отправить чек»</b> и прикрепите скриншот транзакции."
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -739,7 +741,6 @@ def _resolve_font_path() -> str | None:
 
 
 def _resolve_doc_fonts() -> tuple[str | None, str | None]:
-    """Находит или скачивает чистый кириллический шрифт (PT Sans / Ubuntu / Arial) для PDF-документов."""
     reg_candidates = [
         os.path.join(IMG_DIR, "_doc_regular.ttf"),
         "C:\\Windows\\Fonts\\arial.ttf",
@@ -800,7 +801,6 @@ def _resolve_doc_fonts() -> tuple[str | None, str | None]:
             os.path.join(IMG_DIR, "_doc_bold.ttf")
         ) or reg_path
 
-    # Полный офлайн-резерв: используем шрифт из проекта (impact.ttf), чтобы всё равно собрать PDF
     if not reg_path:
         fallback = _resolve_font_path()
         if fallback:
@@ -863,10 +863,8 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_w: int) -> list[s
 
 
 def _make_doc_thumbnail(banner_path: str, thumb_path: str):
-    """Создаёт квадратную обложку 320x320 (< 200 КБ) для предпросмотра PDF прямо в чате Telegram."""
     src = Image.open(banner_path).convert("RGB")
     bg = src.resize((320, 320), Image.Resampling.BILINEAR).filter(ImageFilter.GaussianBlur(12))
-    # Слегка затемняем фон, чтобы центр читался чётко
     bg = Image.blend(bg, Image.new("RGB", (320, 320), (10, 6, 26)), 0.45)
 
     bw = 320
@@ -885,7 +883,6 @@ def _generate_legal_pdf(
     reg_font_path: str,
     bold_font_path: str
 ):
-    """Собирает многостраничный PDF (A4) с фирменным баннером на 1-й странице."""
     W, H = 1000, 1414
     ML, MR, MT, MB = 68, 68, 64, 88
     CONTENT_W = W - ML - MR
@@ -1047,7 +1044,6 @@ def prepare_legal_documents():
             "send_name": send_name,
             "cache_key": cache_key,
         }
-        # Включаем в хэш и сам PDF, и его обложку
         h_doc = _file_md5(disk_path)
         h_th = _file_md5(thumb_path) if os.path.exists(thumb_path) else ""
         FILE_HASHES[cache_key] = f"{h_doc}:{h_th}"
@@ -1668,7 +1664,7 @@ async def set_user_accepted(user, accepted: bool):
         ACCEPTED_USERS.discard(user.id)
 
 
-# ================= БЫСТРАЯ ОТРИСОВКА ЭКРАНОВ БЕЗ БЛОКИРОВОК =================
+# ================= БЫСТРАЯ ОТРИСОВКА ЭКРАНОВ =================
 def _is_duplicate_click(user_id: int, data: str | None) -> bool:
     if not data:
         return False
@@ -1766,20 +1762,16 @@ async def show_doc_screen(
     caption: str,
     kb: InlineKeyboardMarkup
 ):
-    """Единое сообщение: PDF-файл с обложкой-баннером + подпись + кнопки (без разрывов)."""
     meta = DOC_META[doc_key]
     cache_key = meta["cache_key"]
 
     if isinstance(target, CallbackQuery):
         asyncio.create_task(_quick_answer(target))
-        if _is_duplicate_click(target.from_user.id, target.data):
-            return
         msg = target.message
         if not msg:
             return
         chat_id, msg_id = msg.chat.id, msg.message_id
 
-        # Если уже открыт этот же документ — обновляем только подпись/кнопки
         if LAST_SCREEN_TAG.get((chat_id, msg_id)) == cache_key and msg.document:
             try:
                 await msg.edit_caption(caption=caption, reply_markup=kb, request_timeout=REQ_TIMEOUT)
@@ -1790,7 +1782,6 @@ async def show_doc_screen(
             except Exception:
                 pass
 
-        # Если сообщение уже документ — плавная замена на другой PDF in-place
         if msg.document:
             cached_fid = DOC_CACHE.get(cache_key)
             if cached_fid:
@@ -1817,7 +1808,6 @@ async def show_doc_screen(
             except Exception:
                 pass
 
-        # Переход с фото на документ: сначала отправляем документ, потом в фоне удаляем старое
         LAST_SCREEN_TAG.pop((chat_id, msg_id), None)
         await _send_fresh_doc(msg, doc_key, caption, kb)
         asyncio.create_task(_safe_delete(msg))
@@ -1837,15 +1827,12 @@ async def show_screen(
     if isinstance(target, CallbackQuery):
         if answer_cb:
             asyncio.create_task(_quick_answer(target))
-        if _is_duplicate_click(target.from_user.id, target.data):
-            return
         msg = target.message
         if not msg:
             return
         chat_id, msg_id = msg.chat.id, msg.message_id
         has_photo = bool(msg.photo)
 
-        # Быстрый путь: картинка та же -> меняем только подпись и кнопки
         if has_photo and LAST_SCREEN_TAG.get((chat_id, msg_id)) == tag:
             try:
                 await msg.edit_caption(caption=caption, reply_markup=kb, request_timeout=REQ_TIMEOUT)
@@ -1863,7 +1850,6 @@ async def show_screen(
             except Exception:
                 pass
 
-        # Замена фото in-place
         if has_photo:
             cached_fid = PHOTO_CACHE.get(image_name)
             media_file = cached_fid or FSInputFile(os.path.join(IMG_DIR, image_name))
@@ -1887,7 +1873,6 @@ async def show_screen(
             except Exception:
                 pass
 
-        # Переход с документа/текста на фото: отправляем новое, удаляем старое в фоне
         LAST_SCREEN_TAG.pop((chat_id, msg_id), None)
         await _send_fresh_photo(msg, image_name, caption, kb)
         asyncio.create_task(_safe_delete(msg))
@@ -2137,7 +2122,7 @@ XBOX_TEXT = (
 )
 
 
-# ================= ОДНОКРАТНОЕ СОГЛАСИЕ ПРИ ПЕРВОМ ВХОДЕ =================
+# ================= ОДНОКРАТНОЕ СОГЛАСИЕ И ЗАЩИТА ОТ ДАБЛ-КЛИКОВ =================
 async def send_consent_gate(message: Message):
     await _send_fresh_photo(message, "main.jpg", GATE_TEXT, GATE_KB)
 
@@ -2150,7 +2135,16 @@ class TermsGateMiddleware(BaseMiddleware):
         data: Dict[str, Any]
     ) -> Any:
         user = getattr(event, "from_user", None)
-        if not user or user.id in ACCEPTED_USERS:
+        if not user:
+            return await handler(event, data)
+
+        # Единая защита от случайного двойного нажатия одной и той же кнопки
+        if isinstance(event, CallbackQuery):
+            if _is_duplicate_click(user.id, event.data):
+                await _quick_answer(event)
+                return None
+
+        if user.id in ACCEPTED_USERS:
             return await handler(event, data)
 
         if isinstance(event, Message):
@@ -2196,8 +2190,6 @@ async def cb_gate_back(call: CallbackQuery):
 
 @router.callback_query(F.data == "legal_accept")
 async def cb_legal_accept(call: CallbackQuery, state: FSMContext):
-    if _is_duplicate_click(call.from_user.id, call.data):
-        return await _quick_answer(call)
     asyncio.create_task(_quick_answer(call, "✅ Условия приняты!"))
     if await state.get_state():
         await state.clear()
@@ -2221,8 +2213,6 @@ async def cb_legal_accept(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "legal_decline")
 async def cb_legal_decline(call: CallbackQuery, state: FSMContext):
-    if _is_duplicate_click(call.from_user.id, call.data):
-        return await _quick_answer(call)
     await _quick_answer(
         call,
         "Без принятия условий использование магазина невозможно.",
@@ -2264,7 +2254,6 @@ async def cmd_start(message: Message, state: FSMContext):
         await state.clear()
     await register_user(message.from_user, force_update=True)
 
-    # Показываем согласие ТОЛЬКО один раз при самом первом входе
     if message.from_user.id not in ACCEPTED_USERS:
         await send_consent_gate(message)
         return
@@ -2557,10 +2546,8 @@ async def cb_sbp_soon(call: CallbackQuery):
     )
 
 
-@router.callback_query(F.data.startswith("pay_da_") | F.data.startswith("pay_crypto_"))
+@router.callback_query(F.data.startswith(("pay_da_", "pay_crypto_")))
 async def cb_pay(call: CallbackQuery, state: FSMContext):
-    if _is_duplicate_click(call.from_user.id, call.data):
-        return await _quick_answer(call)
     parts = call.data.split("_")
     try:
         method, pid = parts[1], int(parts[2])
@@ -2574,7 +2561,7 @@ async def cb_pay(call: CallbackQuery, state: FSMContext):
     asyncio.create_task(_quick_answer(call))
     await register_user(call.from_user)
 
-    m_name = "DonationAlerts" if method == "da" else "Криптовалюта"
+    m_name = "DonationAlerts" if method == "da" else "Криптовалюта (TON)"
     async with DB_LOCK:
         async with DB_CONN.execute(
             "INSERT INTO orders (user_id, product_name, price, pay_method, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
@@ -3136,7 +3123,6 @@ async def main():
     await init_db_and_cache()
 
     session = AiohttpSession(timeout=25)
-    # Короткий keepalive защищает от зависших NAT-соединений на Docker-хостинге
     if hasattr(session, "_connector_init") and isinstance(session._connector_init, dict):
         session._connector_init["keepalive_timeout"] = 10
 
@@ -3146,7 +3132,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Bombych Store v16 успешно запущен!")
+    logging.info("Bombych Store v16.1 успешно запущен!")
     try:
         await dp.start_polling(
             bot,
