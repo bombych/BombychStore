@@ -42,7 +42,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 CURRENT_DB_NAME = "bombystore_v10.db"
 DB_PATH = os.path.join(DATA_DIR, CURRENT_DB_NAME)
-IMG_DIR = os.path.join(BASE_DIR, "assets_v17")
+IMG_DIR = os.path.join(BASE_DIR, "assets_v18")
 CATALOG_SCHEMA_VERSION = "v12_fortnite_folder"
 
 FORTNITE_CAT_IDS = (1, 2, 3)
@@ -250,7 +250,7 @@ PRIVACY_SECTIONS = [
 ]
 
 
-# ================= ГЕНЕРАТОР БАННЕРОВ И PDF =================
+# ================= ГЕНЕРАТОР АТМОСФЕРНЫХ БАННЕРОВ И PDF =================
 THEME_PALETTES = {
     "purple_forest": {"bg": (5, 7, 22), "glow": (115, 38, 255), "corner_left": (15, 195, 255), "corner_right": (185, 35, 245), "star": (245, 220, 255), "text_top": (195, 65, 255), "text_bot": (105, 20, 225), "stroke": (35, 8, 75), "spark": (125, 235, 255), "tint_mode": "purple"},
     "gta6_sunset": {"bg": (18, 6, 28), "glow": (255, 55, 165), "corner_left": (255, 145, 40), "corner_right": (145, 50, 255), "star": (255, 225, 195), "text_top": (255, 220, 120), "text_bot": (255, 65, 175), "stroke": (48, 10, 58), "spark": (255, 200, 140), "tint_mode": "purple"},
@@ -509,6 +509,149 @@ def prepare_legal_documents():
         FILE_HASHES[ckey] = f"{_file_md5(dpath)}:{_file_md5(tpath) if os.path.exists(tpath) else ''}"
 
 
+def _make_fallback_logo() -> Image.Image:
+    sz = 360
+    im = Image.new("RGBA", (sz, sz), (16, 6, 36, 255))
+    dr = ImageDraw.Draw(im)
+    for y in range(sz):
+        k = math.sin((y / sz) * math.pi)
+        dr.line([(0, y), (sz, y)], fill=(int(45 + 135 * k), int(15 + 55 * k), int(85 + 145 * k), 255))
+    dr.text((34, 102), "Bombych", font=_load_bold_font(74), fill=(255, 255, 255, 255), stroke_width=3, stroke_fill=(160, 40, 240, 255))
+    dr.text((88, 188), "Store", font=_load_bold_font(62), fill=(255, 255, 255, 255), stroke_width=3, stroke_fill=(160, 40, 240, 255))
+    return im
+
+
+def _build_atmospheric_sphere(logo_img: Image.Image, diameter: int, angle: float, tint_mode: str, opacity: float = 0.85) -> Image.Image:
+    src = logo_img.convert("RGBA").resize((diameter, diameter), Image.Resampling.LANCZOS)
+    r, g, b, a = src.split()
+    if tint_mode == "red":
+        src = Image.merge("RGBA", (b, g.point(lambda p: p // 3), r.point(lambda p: p // 4), a))
+    elif tint_mode == "cyan":
+        src = Image.merge("RGBA", (g.point(lambda p: int(p * 0.6)), b, b, a))
+    elif tint_mode == "gold":
+        src = Image.merge("RGBA", (b, b.point(lambda p: int(p * 0.72)), g.point(lambda p: p // 3), a))
+    elif tint_mode == "emerald":
+        src = Image.merge("RGBA", (g.point(lambda p: p // 2), b, g.point(lambda p: int(p * 0.7)), a))
+    src = src.rotate(angle, resample=Image.Resampling.BICUBIC, expand=False)
+    mask = Image.new("L", (diameter, diameter), 0)
+    ImageDraw.Draw(mask).ellipse([2, 2, diameter - 2, diameter - 2], fill=int(255 * opacity))
+    shade = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shade)
+    cx = cy = rad = diameter // 2
+    for step in range(rad, int(rad * 0.68), -3):
+        ratio = (step / rad - 0.68) / 0.32
+        sd.ellipse([cx - step, cy - step, cx + step, cy + step], outline=(4, 2, 14, int((ratio ** 1.7) * 200)), width=4)
+    out = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
+    out.paste(src, (0, 0), mask)
+    return Image.alpha_composite(out, shade)
+
+
+def _draw_foreground_foliage_and_grass(base: Image.Image, pal: dict, rng: random.Random):
+    w, h = base.size
+    fg, rim = Image.new("RGBA", (w, h), (0, 0, 0, 0)), Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    fdraw, rdraw = ImageDraw.Draw(fg), ImageDraw.Draw(rim)
+    dark_sil, mid_sil = (3, 4, 12, 248), (6, 8, 22, 215)
+    rim_l, rim_r, rim_c = (*pal["corner_left"], 110), (*pal["corner_right"], 110), (*pal["glow"], 95)
+
+    for side in ("left", "right"):
+        for i in range(42):
+            cx = rng.randint(-30, 125) if side == "left" else rng.randint(w - 125, w + 30)
+            rx, cy, ry = rng.randint(24, 65), rng.randint(-20, h + 15), rng.randint(20, 55)
+            rc, es = (rim_l, 5) if side == "left" else (rim_r, -5)
+            rdraw.ellipse([cx - rx + es, cy - ry, cx + rx + es, cy + ry], fill=rc)
+            fdraw.ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=dark_sil if i % 2 == 0 else mid_sil)
+        for _ in range(38):
+            x0 = rng.randint(25, 110) if side == "left" else rng.randint(w - 110, w - 25)
+            x1 = x0 + rng.randint(25, 90) if side == "left" else x0 - rng.randint(25, 90)
+            y0, rc = rng.randint(10, h - 20), (rim_l if side == "left" else rim_r)
+            y1 = y0 + rng.randint(-40, 35)
+            xm, ym = (x0 + x1) // 2, (y0 + y1) // 2 - rng.randint(4, 14)
+            rdraw.polygon([(x0, y0 - 4), (xm, ym - 4), (x1, y1), (xm, ym + 4), (x0, y0 + 5)], fill=rc)
+            fdraw.polygon([(x0, y0 - 3), (xm, ym - 3), (x1, y1), (xm, ym + 3), (x0, y0 + 4)], fill=dark_sil)
+
+    for b_idx in range(6):
+        bx = int(w * (0.28 + b_idx * 0.085) + rng.randint(-25, 25))
+        length, angle = rng.randint(65, 135), math.radians(rng.uniform(72, 118))
+        ex, ey = bx + int(math.cos(angle) * length), int(math.sin(angle) * length)
+        fdraw.line([(bx, -10), (ex, ey)], fill=dark_sil, width=5)
+        steps = rng.randint(16, 26)
+        for s in range(steps):
+            t = s / steps
+            px, py = int(bx + (ex - bx) * t), int(-10 + (ey + 10) * t)
+            for ss in (-1, 1):
+                na, nl = angle + ss * math.radians(rng.uniform(22, 52)), rng.randint(18, 42) * (1.0 - 0.35 * t)
+                nx, ny = px + int(math.cos(na) * nl), py + int(math.sin(na) * nl)
+                rdraw.line([(px, py + 1), (nx, ny + 1)], fill=rim_c, width=2)
+                fdraw.line([(px, py), (nx, ny)], fill=dark_sil, width=2)
+
+    for _ in range(135):
+        gx = rng.randint(-10, w + 10)
+        gh = rng.randint(24, int(52 + 65 * ((abs(gx - w / 2) / (w / 2)) ** 1.3)))
+        lean, bw = rng.randint(-38, 38), rng.randint(3, 7)
+        tip_x, tip_y, mid_x, mid_y = gx + lean, h - gh, gx + lean // 2, h - int(gh * 0.55)
+        r_col = rim_l if gx < w * 0.35 else (rim_r if gx > w * 0.65 else rim_c)
+        rdraw.polygon([(gx - bw, h + 4), (mid_x - 2, mid_y), (tip_x, tip_y - 2), (mid_x + 2, mid_y), (gx + bw, h + 4)], fill=r_col)
+        fdraw.polygon([(gx - bw, h + 4), (mid_x - 1, mid_y), (tip_x, tip_y), (mid_x + 2, mid_y), (gx + bw, h + 4)], fill=dark_sil)
+
+    base.alpha_composite(rim.filter(ImageFilter.GaussianBlur(3.2)))
+    base.alpha_composite(fg.filter(ImageFilter.GaussianBlur(1.1)))
+
+
+def _render_chisel_3d_text(canvas: Image.Image, line1: str, line2: str, pal: dict):
+    w, h = canvas.size
+    tm = Image.new("L", (w, h), 0)
+    md = ImageDraw.Draw(tm)
+    if line2:
+        f1, b1 = _fit_font(md, line1, w - 90, 104 if len(line1) <= 9 else 84)
+        f2, b2 = _fit_font(md, line2, w - 90, 86 if len(line2) <= 10 else 72)
+        w1, h1, w2, h2 = b1[2] - b1[0], b1[3] - b1[1], b2[2] - b2[0], b2[3] - b2[1]
+        y1 = (h - (h1 + h2 + 18)) // 2 - b1[1] - 4
+        md.text(((w - w1) // 2 - b1[0], y1), line1, font=f1, fill=255)
+        md.text(((w - w2) // 2 - b2[0], y1 + b1[1] + h1 + 18 - b2[1]), line2, font=f2, fill=255)
+    else:
+        f1, b1 = _fit_font(md, line1, w - 90, 146 if len(line1) <= 7 else (112 if len(line1) <= 10 else 92))
+        md.text(((w - (b1[2] - b1[0])) // 2 - b1[0], (h - (b1[3] - b1[1])) // 2 - b1[1] - 4), line1, font=f1, fill=255)
+
+    nl = Image.new("RGBA", (w, h), (*pal["glow"], 0))
+    nl.putalpha(tm.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.GaussianBlur(12)).point(lambda p: int(p * 0.72)))
+    canvas.alpha_composite(nl)
+
+    sh = Image.new("RGBA", (w, h), (4, 2, 12, 0))
+    sh.putalpha(tm.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.GaussianBlur(6)).point(lambda p: int(p * 0.85)))
+    canvas.alpha_composite(sh, dest=(0, 6))
+
+    st = Image.new("RGBA", (w, h), (*pal["stroke"], 255))
+    st.putalpha(tm.filter(ImageFilter.MaxFilter(5)))
+    canvas.alpha_composite(st)
+
+    hm, cur = Image.new("L", (w, h), 0), tm
+    for _ in range(8):
+        hm = ImageChops.add(hm, cur.point(lambda p: 31 if p > 128 else 0))
+        cur = cur.filter(ImageFilter.MinFilter(3))
+    h_ul, h_dr = Image.new("L", (w, h), 0), Image.new("L", (w, h), 0)
+    h_ul.paste(hm, (-3, -3))
+    h_dr.paste(hm, (3, 3))
+    lf = ImageChops.subtract(h_dr, hm).point(lambda p: min(255, int(p * 3.8)))
+    df = ImageChops.subtract(h_ul, hm).point(lambda p: min(255, int(p * 3.8)))
+
+    face = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    fd = ImageDraw.Draw(face)
+    r1, g1, b1 = pal["text_top"]
+    r2, g2, b2 = pal["text_bot"]
+    for y in range(h):
+        t = y / h
+        fd.line([(0, y), (w, y)], fill=(int(r1 + (r2 - r1) * t), int(g1 + (g2 - g1) * t), int(b1 + (b2 - b1) * t), 255))
+    face.putalpha(tm)
+    canvas.alpha_composite(face)
+
+    hl = Image.new("RGBA", (w, h), (255, 240, 255, 0))
+    hl.putalpha(ImageChops.multiply(lf, tm).point(lambda p: int(p * 0.85)))
+    canvas.alpha_composite(hl)
+    dk = Image.new("RGBA", (w, h), (*pal["stroke"], 0))
+    dk.putalpha(ImageChops.multiply(df, tm).point(lambda p: int(p * 0.85)))
+    canvas.alpha_composite(dk)
+
+
 def generate_scenic_banner(filepath: str, logo_img: Image.Image, theme: str, line1: str, line2: str):
     w, h = 900, 300
     pal = THEME_PALETTES.get(theme, THEME_PALETTES["purple_forest"])
@@ -518,46 +661,30 @@ def generate_scenic_banner(filepath: str, logo_img: Image.Image, theme: str, lin
     for y in range(h):
         t = math.sin((y / h) * math.pi)
         bdraw.line([(0, y), (w, y)], fill=(min(255, int(pal["bg"][0] + pal["glow"][0] * 0.24 * t)), min(255, int(pal["bg"][1] + pal["glow"][1] * 0.24 * t)), min(255, int(pal["bg"][2] + pal["glow"][2] * 0.28 * t)), 255))
+
     ll = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     ld = ImageDraw.Draw(ll)
     ld.ellipse([-60, 125, 290, 360], fill=(*pal["corner_left"], 155))
     ld.ellipse([610, 95, 960, 355], fill=(*pal["corner_right"], 130))
     ld.ellipse([185, 20, 715, 295], fill=(*pal["glow"], 155))
+    ld.polygon([(465, 58), (542, 148), (690, 178), (558, 240), (590, 298), (448, 258), (275, 292), (332, 222), (235, 168), (378, 148)], fill=(*pal["star"], 215))
     base = Image.alpha_composite(base, ll.filter(ImageFilter.GaussianBlur(28)))
+
+    for sx, sy, diam, ang, br, op in ((295, -24, 215, -18, 1.8, 0.88), (455, 240, 145, 25, 2.5, 0.72), (690, 185, 185, -35, 2.2, 0.75)):
+        orb = _build_atmospheric_sphere(logo_img, diam, ang, pal["tint_mode"], opacity=op).filter(ImageFilter.GaussianBlur(br))
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        layer.paste(orb, (sx, sy), orb)
+        base = Image.alpha_composite(base, layer)
 
     sp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     spd = ImageDraw.Draw(sp)
-    for _ in range(38):
-        px, py, pr = rng.randint(40, w - 40), rng.randint(25, h - 25), rng.randint(2, 5)
-        spd.ellipse([px - pr, py - pr, px + pr, py + pr], fill=(*pal["spark"], rng.randint(90, 210)))
-    base = Image.alpha_composite(base, sp.filter(ImageFilter.GaussianBlur(1.5)))
+    for _ in range(42):
+        px, py, pr = rng.randint(40, w - 40), rng.randint(25, h - 25), rng.randint(2, 6)
+        spd.ellipse([px - pr, py - pr, px + pr, py + pr], fill=(*pal["spark"], rng.randint(90, 220)))
+    base = Image.alpha_composite(base, sp.filter(ImageFilter.GaussianBlur(1.6)))
 
-    tm = Image.new("L", (w, h), 0)
-    md = ImageDraw.Draw(tm)
-    if line2:
-        f1, b1 = _fit_font(md, line1, w - 90, 102 if len(line1) <= 9 else 82)
-        f2, b2 = _fit_font(md, line2, w - 90, 84 if len(line2) <= 10 else 68)
-        w1, h1, w2, h2 = b1[2] - b1[0], b1[3] - b1[1], b2[2] - b2[0], b2[3] - b2[1]
-        y1 = (h - (h1 + h2 + 18)) // 2 - b1[1] - 4
-        md.text(((w - w1) // 2 - b1[0], y1), line1, font=f1, fill=255)
-        md.text(((w - w2) // 2 - b2[0], y1 + b1[1] + h1 + 18 - b2[1]), line2, font=f2, fill=255)
-    else:
-        f1, b1 = _fit_font(md, line1, w - 90, 142 if len(line1) <= 7 else 108)
-        md.text(((w - (b1[2] - b1[0])) // 2 - b1[0], (h - (b1[3] - b1[1])) // 2 - b1[1] - 4), line1, font=f1, fill=255)
-
-    nl = Image.new("RGBA", (w, h), (*pal["glow"], 0))
-    nl.putalpha(tm.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.GaussianBlur(12)).point(lambda p: int(p * 0.72)))
-    base.alpha_composite(nl)
-    sl = Image.new("RGBA", (w, h), (*pal["stroke"], 255))
-    sl.putalpha(tm.filter(ImageFilter.MaxFilter(5)))
-    base.alpha_composite(sl)
-    face = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    fd = ImageDraw.Draw(face)
-    for y in range(h):
-        t = y / h
-        fd.line([(0, y), (w, y)], fill=(int(pal["text_top"][0] + (pal["text_bot"][0] - pal["text_top"][0]) * t), int(pal["text_top"][1] + (pal["text_bot"][1] - pal["text_top"][1]) * t), int(pal["text_top"][2] + (pal["text_bot"][2] - pal["text_top"][2]) * t), 255))
-    face.putalpha(tm)
-    base.alpha_composite(face)
+    _draw_foreground_foliage_and_grass(base, pal, rng)
+    _render_chisel_3d_text(base, line1, line2, pal)
     base.convert("RGB").save(filepath, "JPEG", quality=82, optimize=True)
 
 
@@ -565,7 +692,7 @@ def prepare_all_banners():
     cleanup_old_files()
     os.makedirs(IMG_DIR, exist_ok=True)
     lp = _find_user_file(USER_UPLOADED_MAP["logo.jpg"])
-    logo_img = Image.open(lp).convert("RGBA") if lp else Image.new("RGBA", (200, 200), (40, 15, 80, 255))
+    logo_img = Image.open(lp).convert("RGBA") if lp else _make_fallback_logo()
 
     for target, cands in USER_UPLOADED_MAP.items():
         if target != "logo.jpg":
@@ -908,9 +1035,16 @@ def reply_main_kb(uid: int) -> ReplyKeyboardMarkup:
 
 def inline_home_kb(uid: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    for t, c in [("🛒 Каталог", "nav_catalog"), ("👤 Профиль", "nav_profile"), (f"👥 Рефералка ({REF_PERCENT}%)", "nav_ref"), ("🧶 Привязка", "nav_xbox"), ("ℹ️ Инфо", "nav_info"), ("📕 Правила", "nav_rules"), ("🆘 Поддержка", "nav_support"), ("📄 Соглашение", "nav_terms"), ("🔒 Политика", "nav_privacy")]:
-        b.button(text=t, callback_data=c)
-    b.adjust(2, 2, 2, 1, 2)
+    b.button(text="🛒 Каталог товаров", callback_data="nav_catalog")
+    b.button(text="👤 Профиль", callback_data="nav_profile")
+    b.button(text="👥 Рефералка", callback_data="nav_ref")
+    b.button(text="🧶 Привязка Xbox", callback_data="nav_xbox")
+    b.button(text="ℹ️ Информация", callback_data="nav_info")
+    b.button(text="📕 Правила", callback_data="nav_rules")
+    b.button(text="🆘 Поддержка", callback_data="nav_support")
+    b.button(text="📄 Соглашение", callback_data="nav_terms")
+    b.button(text="🔒 Политика", callback_data="nav_privacy")
+    b.adjust(1, 2, 2, 2, 2)
     if uid == ADMIN_ID:
         b.row(InlineKeyboardButton(text="⚙️ Панель управления", callback_data="nav_admin"))
     return b.as_markup()
@@ -1189,7 +1323,7 @@ async def build_profile_view(user):
     role = "Основатель ♦" if user.id == ADMIN_ID else ("VIP Покупатель 👑" if done_cnt >= 5 else ("Покупатель 💲" if done_cnt > 0 else "Клиент 🛴"))
     text = f"👤 <b>Личный кабинет • {html.escape(user.first_name or 'Гость')}</b>\n━━━━━━━━━━━━━━━━━━━━\n🆔 <b>Ваш ID:</b> <code>{user.id}</code>\n🎭 <b>Статус:</b> <b>{role}</b>\n📅 <b>Дата регистрации:</b> <code>{joined}</code>\n\n<blockquote>💰 <b>Баланс:</b> <code>{bal:.0f} ₽</code>\n📦 <b>Выполнено заказов:</b> <code>{done_cnt} шт.</code>\n💎 <b>Сумма покупок:</b> <code>{spent:.0f} ₽</code></blockquote>"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="my_orders"), InlineKeyboardButton(text=f"👥 Рефералка ({REF_PERCENT}%)", callback_data="nav_ref")],
+        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="my_orders"), InlineKeyboardButton(text="👥 Рефералка", callback_data="nav_ref")],
         [InlineKeyboardButton(text="🛒 В каталог", callback_data="nav_catalog"), InlineKeyboardButton(text="⬅️ Меню", callback_data="nav_home")]
     ])
     return text, kb
@@ -1582,7 +1716,7 @@ async def main():
         BotCommand(command="start", description="🏠 Главное меню"),
         BotCommand(command="catalog", description="🛒 Каталог"),
         BotCommand(command="profile", description="👤 Профиль"),
-        BotCommand(command="ref", description=f"👥 Рефералка ({REF_PERCENT}%)"),
+        BotCommand(command="ref", description="👥 Рефералка"),
         BotCommand(command="xbox", description="🧶 Привязка Xbox"),
         BotCommand(command="info", description="ℹ️ Информация"),
         BotCommand(command="rules", description="📕 Правила"),
@@ -1594,7 +1728,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info(f"Bombych Store v17 (@{BOT_USERNAME}) успешно запущен!")
+    logging.info(f"Bombych Store v18 (@{BOT_USERNAME}) успешно запущен!")
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), polling_timeout=10)
     finally:
