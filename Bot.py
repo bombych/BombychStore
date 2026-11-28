@@ -1,4 +1,18 @@
-import asyncio, glob, hashlib, html, logging, math, os, random, re, shutil, subprocess, sys, time, urllib.parse, urllib.request
+import asyncio
+import glob
+import hashlib
+import html
+import logging
+import math
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict
 
@@ -13,14 +27,16 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    Message, CallbackQuery, ErrorEvent, FSInputFile, InputMediaPhoto, InputMediaDocument,
-    ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InlineKeyboardMarkup,
-    InlineKeyboardButton, BotCommand, BotCommandScopeDefault, TelegramObject
+    Message, CallbackQuery, ErrorEvent, FSInputFile,
+    InputMediaPhoto, InputMediaDocument,
+    ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    BotCommand, BotCommandScopeDefault, TelegramObject
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -734,7 +750,12 @@ async def init_db_and_cache():
     await DB_CONN.execute("PRAGMA busy_timeout=5000")
 
     async with DB_LOCK:
-        await DB_CONN.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, balance REAL DEFAULT 0, joined_at TEXT, accepted_terms INTEGER DEFAULT 0, referrer_id INTEGER DEFAULT NULL, ref_earnings REAL DEFAULT 0)")
+        await DB_CONN.execute(
+            "CREATE TABLE IF NOT EXISTS users ("
+            "user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, "
+            "balance REAL DEFAULT 0, joined_at TEXT, accepted_terms INTEGER DEFAULT 0, "
+            "referrer_id INTEGER DEFAULT NULL, ref_earnings REAL DEFAULT 0)"
+        )
         async with DB_CONN.execute("PRAGMA table_info(users)") as cur:
             ucols = {r[1] for r in await cur.fetchall()}
         if "accepted_terms" not in ucols:
@@ -794,7 +815,12 @@ async def init_db_and_cache():
 
 async def reload_catalog_cache():
     global RAM_CATALOG_KB, RAM_FORTNITE_KB
-    RAM_CATS.clear(); RAM_CAT_ORDER.clear(); RAM_PRODS.clear(); RAM_CAT_KBS.clear(); RAM_CAT_CAPTIONS.clear()
+    RAM_CATS.clear()
+    RAM_CAT_ORDER.clear()
+    RAM_PRODS.clear()
+    RAM_CAT_KBS.clear()
+    RAM_CAT_CAPTIONS.clear()
+
     async with DB_LOCK:
         async with DB_CONN.execute("SELECT id, short_name, full_title, image_name, description FROM categories ORDER BY id") as cur:
             cats = await cur.fetchall()
@@ -807,7 +833,8 @@ async def reload_catalog_cache():
         RAM_CAT_ORDER.append(cid)
         RAM_CATS[cid] = {"id": cid, "short_name": sn, "full_title": ft, "image_name": cimg, "description": cd}
         (fb if cid in FORTNITE_CAT_IDS else cb).button(text=sn, callback_data=f"cat_{cid}")
-    cb.adjust(2); cb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav_home"))
+    cb.adjust(2)
+    cb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav_home"))
     RAM_CATALOG_KB = cb.as_markup()
 
     fb.adjust(2, 1)
@@ -1027,7 +1054,11 @@ async def show_dynamic_photo(call: CallbackQuery, fid: str | None, fallback: str
 
 # ================= КЛАВИАТУРЫ И ТЕКСТЫ =================
 def reply_main_kb(uid: int) -> ReplyKeyboardMarkup:
-    rows = [[KeyboardButton(text="🛒 Каталог"), KeyboardButton(text="👤 Профиль")], [KeyboardButton(text="👥 Рефералка"), KeyboardButton(text="ℹ️ Инфо"), KeyboardButton(text="📕 Правила")], [KeyboardButton(text="🆘 Поддержка")]]
+    rows = [
+        [KeyboardButton(text="🛒 Каталог"), KeyboardButton(text="👤 Профиль")],
+        [KeyboardButton(text="👥 Рефералка"), KeyboardButton(text="ℹ️ Инфо"), KeyboardButton(text="📕 Правила")],
+        [KeyboardButton(text="🆘 Поддержка")],
+    ]
     if uid == ADMIN_ID:
         rows[-1].append(KeyboardButton(text="⚙️ Админка"))
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, input_field_placeholder="Меню Bombych Store...")
@@ -1035,7 +1066,6 @@ def reply_main_kb(uid: int) -> ReplyKeyboardMarkup:
 
 def inline_home_kb(uid: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="🛒 Каталог товаров", callback_data="nav_catalog")
     b.button(text="👤 Профиль", callback_data="nav_profile")
     b.button(text="👥 Рефералка", callback_data="nav_ref")
     b.button(text="🧶 Привязка Xbox", callback_data="nav_xbox")
@@ -1044,7 +1074,8 @@ def inline_home_kb(uid: int) -> InlineKeyboardMarkup:
     b.button(text="🆘 Поддержка", callback_data="nav_support")
     b.button(text="📄 Соглашение", callback_data="nav_terms")
     b.button(text="🔒 Политика", callback_data="nav_privacy")
-    b.adjust(1, 2, 2, 2, 2)
+    b.button(text="🛒 Каталог товаров", callback_data="nav_catalog")
+    b.adjust(2, 2, 2, 2, 1)
     if uid == ADMIN_ID:
         b.row(InlineKeyboardButton(text="⚙️ Панель управления", callback_data="nav_admin"))
     return b.as_markup()
@@ -1620,7 +1651,8 @@ async def cb_adm_add_item(c: CallbackQuery):
     b = InlineKeyboardBuilder()
     for cid in RAM_CAT_ORDER:
         b.button(text=f"FN: {RAM_CATS[cid]['short_name']}" if cid in FORTNITE_CAT_IDS else RAM_CATS[cid]["short_name"], callback_data=f"admcat_{cid}")
-    b.adjust(2); b.row(InlineKeyboardButton(text="⬅️ Отмена", callback_data="nav_admin"))
+    b.adjust(2)
+    b.row(InlineKeyboardButton(text="⬅️ Отмена", callback_data="nav_admin"))
     await c.message.answer("📂 <b>Выберите категорию:</b>", reply_markup=b.as_markup(), request_timeout=REQ_TIMEOUT)
 
 
@@ -1728,7 +1760,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info(f"Bombych Store v18 (@{BOT_USERNAME}) успешно запущен!")
+    logging.info(f"Bombych Store v18.1 (@{BOT_USERNAME}) успешно запущен!")
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), polling_timeout=10)
     finally:
